@@ -16,6 +16,7 @@ Login:
 v5 — ID-based login | bcrypt passwords | resubmission | accommodation stats
      Core optimizer: scipy HiGHS MILP | Smart Greedy | OR-Tools CP-SAT
      NOTE: Online duty suspended this semester — all duties are Offline only.
+     Semester: Odd Semester 2026-27 (Nov/Dec 2026) — see SEMESTER CONFIG block.
 """
 
 import os
@@ -67,6 +68,16 @@ except Exception:
 warnings.filterwarnings("ignore")
 
 # ─── File names ──────────────────────────────────────────────── #
+# ═══════════════════════════════════════════════════════════════ #
+#   SEMESTER CONFIG — change these at the start of every cycle    #
+# ═══════════════════════════════════════════════════════════════ #
+SEMESTER_LABEL     = "Odd Semester 2026-27 (Nov/Dec 2026 End-Semester)"
+# Calendar window shown in the portal (always rendered, even before slots are loaded)
+SEMESTER_CAL_START = datetime.date(2026, 11, 1)
+SEMESTER_CAL_END   = datetime.date(2026, 12, 31)
+# Scholar exam rule: exam day + this many working days before it are blocked
+EXAM_BUFFER_DAYS   = 2
+
 FACULTY_FILE      = "Faculty_Master.xlsx"
 OFFLINE_FILE      = "Offline_Duty.xlsx"
 ONLINE_FILE       = "Online_Duty.xlsx"
@@ -189,20 +200,13 @@ DESIG_FULL = {
 # Used when Supabase v1-v5 columns are NULL or missing for a faculty.
 # Key = exact name as stored in Supabase | Value = set of date strings "YYYY-MM-DD"
 FACULTY_VALUATION_OVERRIDE_RAW: dict = {
-    "T.Mohanraj":       {"2026-06-16"},
-    "T.Panneerselvam":  {"2026-06-16"},
-    "S. Hariharan":     {"2026-06-16"},
-    "B.Jayaraman":      {"2026-06-16"},
-    "G. Rajamohan":     {"2026-06-16"},
-    "K. Palaksha Reddy":{"2026-06-16"},
-    "D.Venkatesan":     {"2026-06-16"},
-    "M. Tagore":        {"2026-06-16"},
-    "S. Paul Joshua":   {"2026-06-16"},
+    # Odd Sem 2026-27: valuation dates to be updated in Supabase (V1..V5).
+    # Add entries here only as a fallback, e.g.  "T.Mohanraj": {"2026-12-10"},
 }
 # ── Per-faculty date cap — duties must be assigned BEFORE this date ──────────
 # Key = name substring (without honorifics) | Value = "YYYY-MM-DD" (exclusive upper bound)
 FACULTY_DATE_CAP_RAW: dict = {
-    "S. Balamurli": "2026-05-15",   # all duties must fall before 15-May-2026
+    # Even Sem 2025-26 entry removed (S. Balamurli, before 15-May-2026)
 }
 
 # ── Per-faculty duty count overrides ─────────────────────────────────────────
@@ -218,8 +222,8 @@ FACULTY_DUTY_OVERRIDE_RAW: dict = {
 # Key = name substring as stored in Supabase (without honorifics)
 # Value = list of (YYYY-MM-DD, session) tuples
 FORCED_ASSIGNMENTS_RAW: dict = {
-    "Mohammed Mustafa": [("2026-06-11", "FN"), ("2026-06-11", "AN")],   # both sessions on 11-Jun
-    "Jeyaraj":          [("2026-06-10", "AN"), ("2026-06-11", "AN")],
+    # Even Sem 2025-26 entries (Mustafa / Jeyaraj, 10-11 Jun 2026) removed.
+    # Example:  "Name": [("2026-11-16", "FN")],
 }
 
 # Antony (Shri S. Antony) gets 2 Saturday duties; total duties = 4
@@ -545,20 +549,30 @@ _FIVE_DUTY_RAW = [
 ]
 FIVE_DUTY_CLEAN = {_norm_name(n) for n in _FIVE_DUTY_RAW}
 
-# Per-faculty exam dates (raw, for display highlights in calendar & UI)
+# Per-faculty exam dates — Research Scholars Course Work, Odd Sem 2026-27
+# Source: Research_Scholars_Course_Work_details (odd sem 26-27).xlsx
+# Scholars with "NA" for all exam dates are not listed.
+def _exam_key(name: str) -> str:
+    """Tolerant name key for exam-date lookups: honorifics stripped, then only
+    letters kept, so 'Shri V.Gladstone' == 'V. Gladstone' == 'v gladstone'."""
+    return "".join(ch for ch in _norm_name(name) if ch.isalpha())
+
+_D = datetime.date
+_FACULTY_EXAM_DATES_RAW: dict = {
+    "Shri V.Gladstone":       {_D(2026, 11, 25)},                                     # RS1007
+    "Shri N. Arun Kumar":     {_D(2026, 11, 25)},                                     # RS1063
+    "S. Smrithika":           {_D(2026, 11, 20)},                                     # RS1092
+    "V. Ramesh Srenyvasan":   {_D(2026, 11, 14)},                                     # RS1155
+    "P. Panneerselvam":       {_D(2026, 11, 19)},                                     # RS1197
+    "S. Sabrish":             {_D(2026, 11, 23), _D(2026, 11, 30)},                   # RS1222
+    "C. Frizil Kinsly":       {_D(2026, 11, 19)},                                     # RS1232
+    "S. Manikandan":          {_D(2026, 11, 14), _D(2026, 11, 17), _D(2026, 11, 23)}, # RS1233
+    "Shri I.Ilam Parithi":    {_D(2026, 11, 14), _D(2026, 11, 19), _D(2026, 11, 25)}, # RS1302
+    "R. PRABHURAJ":           {_D(2026, 11, 19), _D(2026, 11, 25)},                   # RS1322
+}
+del _D
 FACULTY_EXAM_DATES_CLEAN: dict = {
-    _norm_name("Shri. P. Vijay Guru"):       {datetime.date(2026, 5, 20)},
-    _norm_name("Shri E. Ezekiel"):           {datetime.date(2026, 5, 11)},
-    _norm_name("Shri S. Varadharajan"):      {datetime.date(2026, 5, 22)},
-    _norm_name("Ms S. Kiruba Kari"):         {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 13)},
-    _norm_name("Shri V. Adhavan"):           {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 13)},
-    _norm_name("Shri V. Ramesh Srenyvasan"): {datetime.date(2026, 5, 11),
-                                              datetime.date(2026, 5, 13)},
-    _norm_name("Shri S. Sabrish"):           {datetime.date(2026, 5, 22)},
-    _norm_name("Shri P. Sarathkumar"):       {datetime.date(2026, 5, 18)},
-    _norm_name("Shri N. Arun Kumar"):        {datetime.date(2026, 5, 26)},
+    _exam_key(k): v for k, v in _FACULTY_EXAM_DATES_RAW.items()
 }
 
 def _prev_working_day(d: datetime.date, steps: int) -> datetime.date:
@@ -570,7 +584,7 @@ def _prev_working_day(d: datetime.date, steps: int) -> datetime.date:
             cur -= datetime.timedelta(days=1)
     return cur
 
-def _expand_exam_blackout(exam_dates: set, buffer: int = 2) -> set:
+def _expand_exam_blackout(exam_dates: set, buffer: int = EXAM_BUFFER_DAYS) -> set:
     """Return exam_dates expanded with n-1 and n-2 working days before each exam date."""
     expanded = set(exam_dates)
     for d in exam_dates:
@@ -656,7 +670,7 @@ def valuation_dates_for(row, faculty_name: str = ""):
                 dates.add(ts.date())
         except Exception:
             pass
-    # Merge override dates (ensures 16-Jun-2026 always shows for specified faculty)
+    # Merge fallback override dates (FACULTY_VALUATION_OVERRIDE_RAW)
     fn = _norm_name(faculty_name)
     if fn in FACULTY_VALUATION_OVERRIDE:
         dates |= FACULTY_VALUATION_OVERRIDE[fn]
@@ -715,18 +729,7 @@ def detect_semester(slot_dates=None):
     override = st.session_state.get("semester_override", "Auto-detect")
     if override and override != "Auto-detect":
         return override
-    now = datetime.date.today()
-    if slot_dates:
-        months = {d.month for d in slot_dates}
-        if months & {5, 6}:
-            return "Even Semester (May/Jun 2026 End-Semester)"
-        if months & {11, 12, 1}:
-            return "Odd Semester (Nov/Dec End-Semester)"
-    if now.month in (5, 6):
-        return "Even Semester (May/Jun 2026 End-Semester)"
-    if now.month in (11, 12, 1):
-        return "Odd Semester (Nov/Dec End-Semester)"
-    return "End-Semester Examination"
+    return SEMESTER_LABEL
 
 def get_exam_period(slot_dates):
     if not slot_dates:
@@ -746,6 +749,10 @@ def render_header(logo=True):
     st.markdown(
         "<h4 style='text-align:center;margin-top:0'>"
         "School of Mechanical Engineering</h4>",
+        unsafe_allow_html=True)
+    st.markdown(
+        "<div style='text-align:center;font-weight:700;color:#1e3a5f;margin-top:-6px'>"
+        f"{detect_semester()}</div>",
         unsafe_allow_html=True)
     st.markdown("---")
 
@@ -1085,20 +1092,30 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_blocked_dates=None):
     st.markdown(f"#### {title}")
+    if duty_df is None or duty_df.empty or "Date" not in duty_df.columns:
+        st.info("Duty slots not yet published — showing the semester calendar.")
+        duty_df = pd.DataFrame({"Date": pd.Series(dtype="datetime64[ns]"),
+                                "Session": pd.Series(dtype=str),
+                                "Required": pd.Series(dtype=int)})
+    duty_df = duty_df.copy()
+    duty_df["Date"] = pd.to_datetime(duty_df["Date"], errors="coerce")
+    duty_df = duty_df.dropna(subset=["Date"])
+
+    # Months to show = full semester window (Nov–Dec 2026) + any slot months outside it
+    months = set()
+    _m = datetime.date(SEMESTER_CAL_START.year, SEMESTER_CAL_START.month, 1)
+    while _m <= SEMESTER_CAL_END:
+        months.add((_m.year, _m.month))
+        _m = (_m.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+    months |= {(d.year, d.month) for d in duty_df["Date"]}
+    months = sorted(months)
+
     if duty_df.empty:
-        st.info("No slot data available.")
-        return
-
-    slot_day_set = set(duty_df["Date"].dt.date)
-    if not slot_day_set:
-        return
-    first_slot = min(slot_day_set)
-    last_slot  = max(slot_day_set)
-
-    months = sorted({(d.year, d.month) for d in duty_df["Date"]})
-    sg = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
-    duty_map = {(row["Date"].date(), str(row["Session"]).upper()): int(row["Required"])
-                for _, row in sg.iterrows()}
+        duty_map = {}
+    else:
+        sg = duty_df.groupby(["Date", "Session"], as_index=False)["Required"].sum()
+        duty_map = {(row["Date"].date(), str(row["Session"]).upper()): int(row["Required"])
+                    for _, row in sg.iterrows()}
     val_set          = set(val_dates)
     exam_set         = set(exam_dates)         if exam_dates         else set()
     buffer_set       = set(buffer_dates)       if buffer_dates       else set()
@@ -1135,8 +1152,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         grid = []; week = [None] * fw
         for dt in days:
             dt_date = dt.date()
-            cell = dt_date if (first_slot <= dt_date <= last_slot) else None
-            week.append(cell)
+            week.append(dt_date)
             if len(week) == 7:
                 grid.append(week); week = []
         if week:
@@ -1413,7 +1429,7 @@ def _load_core(log):
         if sl["type"] not in allowed:                                        return False
         if sl["date"] in fac_val.get(fn, set()):                            return False
         # Per-faculty blackout dates (exam on that day etc.)
-        if _norm_name(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[_norm_name(fn)]:
+        if _exam_key(fn) in FACULTY_BLACKOUT_CLEAN and sl["date"] in FACULTY_BLACKOUT_CLEAN[_exam_key(fn)]:
             return False
         # Per-faculty date cap (duties must be before specified date)
         if _norm_name(fn) in FACULTY_DATE_CAP and sl["date"] >= FACULTY_DATE_CAP[_norm_name(fn)]:
@@ -1570,7 +1586,7 @@ def _greedy_solve(core, log):
                 return True
         return False  # slot not in exam schedule
 
-    # Apply FORCED_ASSIGNMENTS (Mustafa → 10+11 Jun, Jeyaraj → 10+11 Jun)
+    # Apply FORCED_ASSIGNMENTS (if any)
     for _fn in ALL_FAC:
         _fnc = _norm_name(_fn)
         if _fnc in FORCED_ASSIGNMENTS:
@@ -2864,8 +2880,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sopts = offline_df.copy()
     sopts["Date"]     = pd.to_datetime(sopts["Date"], errors="coerce")
     sopts["DateOnly"] = sopts["Date"].dt.date
-    fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(_norm_name(sel_name), set())
-    fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(_norm_name(sel_name), set())
+    fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(_exam_key(sel_name), set())
+    fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(_exam_key(sel_name), set())
 
     # Determine if this designation is NOT allowed on Saturdays
     _sat_blocked_desig = desig2 not in {"TA", "RA"}
