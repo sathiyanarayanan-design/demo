@@ -2784,12 +2784,11 @@ def page_admin(fac_df, offline_df, online_df):
         st.dataframe(acc_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
-        st.markdown("#### 📥 Update Faculty & Research Scholar List (Excel → Supabase)")
-        st.caption("Upload the faculty list and/or the research scholar list. "
-                   "Existing faculty keep their password, admin rights and valuation dates — "
-                   "only Name / Designation / Email / Mobile are updated. "
-                   f"New faculty get the default password **{DEFAULT_PASSWORD}** (forced change on first login).")
-        _up = st.file_uploader("Excel file(s)", type=["xlsx", "xls"],
+        st.markdown("#### 📥 Replace Faculty & Research Scholar List")
+        st.caption("Upload the new Excel (faculty + research scholars). The portal list becomes "
+                   "exactly this Excel: new names are added, changed names are updated, and "
+                   "names not in the Excel are removed.")
+        _up = st.file_uploader("New faculty list (.xlsx)", type=["xlsx", "xls"],
                                accept_multiple_files=True, key="fac_sync_upload")
         if _up:
             try:
@@ -2798,73 +2797,54 @@ def page_admin(fac_df, offline_df, online_df):
                 st.error(f"Could not read the file: {_e}")
                 _new = {}
             if _new:
+                _me = _norm_id(st.session_state.get("_logged_fid", ""))
                 _plan = plan_faculty_sync(_new, all_fac_rows)
-                _c1, _c2, _c3 = st.columns(3)
-                _c1.metric("New (to add)", len(_plan["add"]))
-                _c2.metric("Changed (to update)", len(_plan["update"]))
-                _c3.metric("In Supabase but not in Excel", len(_plan["missing"]))
-                if _plan["add"]:
-                    with st.expander(f"➕ {len(_plan['add'])} new faculty"):
-                        st.dataframe(pd.DataFrame(_plan["add"]), use_container_width=True, hide_index=True)
-                if _plan["update"]:
-                    with st.expander(f"✏️ {len(_plan['update'])} changes"):
-                        st.dataframe(pd.DataFrame(_plan["update"]), use_container_width=True, hide_index=True)
-                _del_ok = False
-                if _plan["missing"]:
-                    with st.expander(f"➖ {len(_plan['missing'])} not in the Excel"):
-                        st.dataframe(pd.DataFrame([{
-                            "ID No.": r["faculty_id"], "Name": r["name"],
-                            "Admin": "👑" if r.get("is_admin") else ""}
-                            for r in _plan["missing"]]), use_container_width=True, hide_index=True)
-                    _del_ok = st.checkbox(
-                        "Also remove these from Supabase (admins are never removed; "
-                        "their willingness/allotment rows are also deleted)", key="fac_sync_del")
-                if st.button("✅ Apply to Supabase", type="primary",
+                _remove = [r for r in _plan["missing"] if _norm_id(r["faculty_id"]) != _me]
+                st.info(f"**{len(_new)}** names in the Excel  →  "
+                        f"**{len(_plan['add'])}** added · **{len(_plan['update'])}** updated · "
+                        f"**{len(_remove)}** old names removed")
+                if _remove:
+                    with st.expander("See names that will be removed"):
+                        st.write(", ".join(f"{r['name']} ({r['faculty_id']})" for r in _remove))
+                if st.button("✅ Replace Faculty List", type="primary",
                              use_container_width=True, key="btn_fac_sync"):
-                    _ok, _err = 0, []
+                    _err = []
                     _h = hash_password(DEFAULT_PASSWORD)
                     for _r in _plan["add"]:
                         try:
                             _sb().table("faculty").insert({**_r, "password_hash": _h,
                                 "must_change_pw": True, "is_admin": False}).execute()
-                            _ok += 1
                         except Exception as _e:
                             _err.append(f"Add {_r['faculty_id']}: {_e}")
                     for _r in _plan["update"]:
                         _f = {k: v for k, v in _r.items() if k not in ("faculty_id", "old_name")}
                         try:
                             _sb().table("faculty").update(_f).eq("faculty_id", _r["faculty_id"]).execute()
-                            _ok += 1
                         except Exception as _e:
                             _err.append(f"Update {_r['faculty_id']}: {_e}")
-                    if _del_ok:
-                        for _r in _plan["missing"]:
-                            if _r.get("is_admin"):
-                                continue
-                            try:
-                                for _t in ("willingness", "final_allocation"):
-                                    _sb().table(_t).delete().eq("faculty_id", _r["faculty_id"]).execute()
-                                _sb().table("faculty").delete().eq("faculty_id", _r["faculty_id"]).execute()
-                                _ok += 1
-                            except Exception as _e:
-                                _err.append(f"Remove {_r['faculty_id']}: {_e}")
+                    for _r in _remove:
+                        try:
+                            for _t in ("willingness", "final_allocation"):
+                                _sb().table(_t).delete().eq("faculty_id", _r["faculty_id"]).execute()
+                            _sb().table("faculty").delete().eq("faculty_id", _r["faculty_id"]).execute()
+                        except Exception as _e:
+                            _err.append(f"Remove {_r['faculty_id']}: {_e}")
                     st.cache_data.clear()
-                    # verify against the database (RLS can silently ignore writes)
+                    # Verify against the database (RLS can silently ignore writes)
                     _after = plan_faculty_sync(_new, db_get_all_faculty())
-                    _pending = len(_after["add"]) + len(_after["update"]) + (
-                        len([r for r in _after["missing"] if not r.get("is_admin")]) if _del_ok else 0)
+                    _pending = (len(_after["add"]) + len(_after["update"]) +
+                                len([r for r in _after["missing"] if _norm_id(r["faculty_id"]) != _me]))
                     if _err:
                         st.error("Some changes failed:\n\n" + "\n\n".join(_err[:10]))
                     if _pending:
-                        st.error(f"❌ {_pending} change(s) did not reach Supabase. This is usually "
-                                 "Row Level Security on the `faculty` table — run the SQL below once, "
-                                 "or use the service_role key in SUPABASE_KEY.")
+                        st.error(f"❌ {_pending} change(s) did not reach Supabase (Row Level Security). "
+                                 "Run this once in Supabase → SQL Editor, then upload again:")
                         st.code('create policy "admin insert faculty" on faculty for insert with check (true);\n'
                                 'create policy "admin update faculty" on faculty for update using (true);\n'
                                 'create policy "admin delete faculty" on faculty for delete using (true);',
                                 language="sql")
                     else:
-                        st.success(f"✅ Faculty list updated in Supabase ({_ok} change(s) applied).")
+                        st.success(f"✅ Faculty list replaced — {len(_new)} names now in the portal.")
 
         st.markdown("---")
         st.markdown("#### 🔑 Reset a Faculty's Password")
