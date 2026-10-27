@@ -20,6 +20,7 @@ v5 — ID-based login | bcrypt passwords | resubmission | accommodation stats
 """
 
 import os
+import re
 import io
 import json
 import secrets
@@ -342,7 +343,7 @@ def db_consume_reset_token(token: str):
 
 def _in_semester_window(v) -> bool:
     try:
-        d = pd.to_datetime(str(v).strip()[:10], errors="coerce")
+        d = parse_date_safe(v)
         return pd.notna(d) and SEMESTER_CAL_START <= d.date() <= SEMESTER_CAL_END
     except Exception:
         return False
@@ -376,7 +377,7 @@ def db_submit_willingness(fid: str, faculty_name: str, slots: list):
         if hasattr(d, "strftime"):
             return d.strftime("%Y-%m-%d")
         # fallback: parse string in any format → ISO
-        return pd.to_datetime(str(d), dayfirst=True).strftime("%Y-%m-%d")
+        return to_dt(str(d)).strftime("%Y-%m-%d")
     rows = [{"faculty_id": fid, "faculty_name": faculty_name,
              "duty_date": _to_iso(s["Date"]), "session": s["Session"]} for s in slots]
     if rows: _sb().table("willingness").insert(rows).execute()
@@ -770,8 +771,15 @@ def normalize_session(v):
         return "AN"
     return t
 
+_ISO_RE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}")
+
 def parse_date_safe(val):
-    """Robust multi-format date parser."""
+    """Single date parser for the whole app — never confuses DD-MM with MM-DD.
+      • date / datetime / Timestamp objects               → used as-is
+      • YYYY-MM-DD (Supabase / ISO, with or without time)  → year-month-day
+      • anything else (25-11-2026, 25.11.2026, 25/11/26)   → DAY first
+    Note: pd.to_datetime("2026-12-02", dayfirst=True) wrongly gives 12-Feb-2026,
+    so the app must never call it with dayfirst on ISO strings."""
     if val is None:
         return pd.NaT
     if isinstance(val, pd.Timestamp):
@@ -779,15 +787,27 @@ def parse_date_safe(val):
     if isinstance(val, (datetime.datetime, datetime.date)):
         return pd.Timestamp(val)
     s = str(val).strip()
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y"):
+    if not s or s.lower() in ("nan", "nat", "none", "na"):
+        return pd.NaT
+    m = _ISO_RE.match(s)
+    if m:
+        return pd.to_datetime(m.group(0), format="%Y-%m-%d", errors="coerce")
+    s2 = s.split()[0].replace(".", "-").replace("/", "-")
+    for fmt in ("%d-%m-%Y", "%d-%m-%y"):
         try:
-            return pd.to_datetime(s, format=fmt)
+            return pd.to_datetime(s2, format=fmt)
         except Exception:
             pass
     return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
+def to_dt(x):
+    """parse_date_safe for a scalar OR a pandas Series (returns a datetime64 Series)."""
+    if isinstance(x, pd.Series):
+        return pd.to_datetime(x.map(parse_date_safe), errors="coerce")
+    return parse_date_safe(x)
+
 def fmt_day(val):
-    dt = pd.to_datetime(val, dayfirst=True, errors="coerce")
+    dt = to_dt(val)
     return f"{dt.strftime('%d-%m-%Y')} ({dt.strftime('%A')})" if pd.notna(dt) else str(val)
 
 def demand_category(req: int) -> str:
@@ -809,9 +829,7 @@ def valuation_dates_for(row, faculty_name: str = ""):
         except Exception:
             pass
         try:
-            ts = pd.to_datetime(val, dayfirst=False, errors="coerce")   # Supabase stores ISO
-            if pd.isna(ts):
-                ts = pd.to_datetime(val, dayfirst=True, errors="coerce") # fallback DD-MM-YYYY
+            ts = parse_date_safe(val)   # ISO from Supabase, or DD-MM-YYYY
             if pd.notna(ts):
                 dates.add(ts.date())
         except Exception:
@@ -824,12 +842,12 @@ def valuation_dates_for(row, faculty_name: str = ""):
 
 def qp_dates_for(row):
     return sorted({
-        pd.to_datetime(row[c], dayfirst=True, errors="coerce").strftime("%d-%m-%Y")
+        to_dt(row[c]).strftime("%d-%m-%Y")
         for c in row.index
         if "QP" in str(c).upper()
         and "DATE" in str(c).upper()
         and pd.notna(row[c])
-        and pd.notna(pd.to_datetime(row[c], dayfirst=True, errors="coerce"))
+        and pd.notna(to_dt(row[c]))
     })
 
 def fac_mask(df, sel_clean):
@@ -949,7 +967,7 @@ def load_slots(off_path, on_path):
             df["Date"] = pd.to_datetime(df["Date"]); return df
         df = pd.DataFrame(rows)
         df.rename(columns={"duty_date":"Date","session":"Session","required":"Required"}, inplace=True)
-        df["Date"]     = pd.to_datetime(df["Date"], errors="coerce")
+        df["Date"]     = to_dt(df["Date"])
         df["Session"]  = df["Session"].apply(normalize_session)
         df["Required"] = pd.to_numeric(df["Required"], errors="coerce").fillna(1).astype(int)
         return df[["Date","Session","Required"]]
@@ -1010,7 +1028,7 @@ def slot_probability(all_will_df, duty_df, date_val, session_val):
 
     applicants = 0
     if not all_will_df.empty and "Date" in all_will_df.columns:
-        norm = pd.to_datetime(all_will_df["Date"], dayfirst=True, errors="coerce")
+        norm = to_dt(all_will_df["Date"])
         applicants = int((
             (norm.dt.date == date_val) &
             (all_will_df["Session"].str.upper() == session_val.upper())
@@ -1106,7 +1124,7 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 
     duty_rows = []
     for _, ar in allot_rows.iterrows():
-        norm = pd.to_datetime(ar["Date"], dayfirst=True, errors="coerce")
+        norm = to_dt(ar["Date"])
         if pd.isna(norm): continue
         sess     = str(ar.get("Session", "")).strip().upper()
         dtype    = str(ar.get("Type", "")).strip()
@@ -1448,8 +1466,9 @@ def _load_core(log):
             val = r.get(c)
             if val and str(val).strip() not in ("", "None", "NaT", "nan"):
                 try:
-                    vd.add(pd.to_datetime(str(val).strip()[:10],
-                                          format="%Y-%m-%d").date())
+                    _v = parse_date_safe(val)
+                    if pd.notna(_v):
+                        vd.add(_v.date())
                 except Exception:
                     pass
         fac_val[r["Name"]] = vd
@@ -1459,8 +1478,7 @@ def _load_core(log):
         slots = []
         for r in rows:
             try:
-                dt   = pd.to_datetime(str(r["duty_date"]).strip()[:10],
-                                      format="%Y-%m-%d").date()
+                dt   = parse_date_safe(r["duty_date"]).date()
                 sess = normalize_session(r["session"])
                 req  = max(int(r.get("required", 1)), 0)
                 if sess in ("FN", "AN"):
@@ -1478,7 +1496,7 @@ def _load_core(log):
 
     wdf = get_all_willingness().drop(columns=["FacultyClean"], errors="ignore")
     if not wdf.empty:
-        wdf["Date"]    = pd.to_datetime(wdf["Date"], dayfirst=True, errors="coerce")
+        wdf["Date"]    = to_dt(wdf["Date"])
         wdf["Session"] = wdf["Session"].astype(str).str.strip().str.upper()
         wdf = wdf.dropna(subset=["Date"])
     submitted  = set(wdf["Faculty"].str.strip().unique()) if not wdf.empty else set()
@@ -2589,8 +2607,8 @@ def page_admin(fac_df, offline_df, online_df):
 
             if not diag_wdf.empty and slot_dates_diag:
                 wdf_diag = diag_wdf.copy()
-                wdf_diag["_date"] = pd.to_datetime(
-                    wdf_diag["Date"], dayfirst=True, errors="coerce").dt.date
+                wdf_diag["_date"] = to_dt(
+                    wdf_diag["Date"]).dt.date
                 will_dates_diag = set(wdf_diag["_date"].dropna())
                 overlap_diag    = will_dates_diag & slot_dates_diag
                 only_will_diag  = will_dates_diag - slot_dates_diag
@@ -2685,7 +2703,7 @@ def page_admin(fac_df, offline_df, online_df):
                             "faculty_id":   _fid_val,
                             "faculty_name": _nm,
                             "designation":  str(_ar.get("Designation","")),
-                            "duty_date":    str(pd.to_datetime(_ar["Date"], dayfirst=True).date()),
+                            "duty_date":    str(to_dt(_ar["Date"]).date()),
                             "session":      str(_ar.get("Session","")).strip().upper(),
                             "duty_type":    str(_ar.get("Type","Offline")).strip(),
                             "allocated_by": str(_ar.get("Allocated_By","")).strip(),
@@ -2778,7 +2796,7 @@ def page_admin(fac_df, offline_df, online_df):
                 wr_a = wd_admin[wm_a]
                 if not wr_a.empty and {"Date","Session"}.issubset(wr_a.columns):
                     for d2, s2 in zip(wr_a["Date"], wr_a["Session"]):
-                        nd = pd.to_datetime(d2, dayfirst=True, errors="coerce")
+                        nd = to_dt(d2)
                         if pd.notna(nd):
                             admin_will_set.add((nd.date(), str(s2).upper()))
             am_a = fac_mask(av, admin_sc)
@@ -3044,7 +3062,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
         wm = fac_mask(wd2, sel_clean); wr = wd2[wm]
         if not wr.empty and {"Date", "Session"}.issubset(wr.columns):
             for d2, s2 in zip(wr["Date"], wr["Session"]):
-                nd = pd.to_datetime(d2, dayfirst=True, errors="coerce")
+                nd = to_dt(d2)
                 if pd.notna(nd):
                     wdisp.append(f"{fmt_day(d2)} - {str(s2).upper()}")
                     will_pairs.add((nd.date(), str(s2).upper()))
@@ -3059,11 +3077,11 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
         _mode   = str(_arow.get("duty_type","")).strip()
         _sat_tag = ""
         try:
-            if pd.to_datetime(_raw_d).weekday() == 5:
+            if parse_date_safe(_raw_d).weekday() == 5:
                 _sat_tag = " — Saturday"
         except: pass
         idisp.append(f"{fmt_day(_raw_d)} - {_sess} ({_mode}){_sat_tag}")
-        nd2 = pd.to_datetime(_raw_d, errors="coerce")
+        nd2 = parse_date_safe(_raw_d)
         if pd.notna(nd2):
             allot_pairs.add((nd2.date(), _sess))
 
@@ -3392,7 +3410,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
             rm = st.selectbox("Sl.No to remove", options=sdf["Sl.No"].tolist())
             if st.button("🗑 Remove Row", use_container_width=True):
                 tgt = sdf[sdf["Sl.No"] == rm].iloc[0]
-                td  = pd.to_datetime(tgt["Date"], dayfirst=True).date()
+                td  = to_dt(tgt["Date"]).date()
                 ts  = tgt["Session"]
                 st.session_state.selected_slots = [
                     s for s in st.session_state.selected_slots
@@ -3454,7 +3472,7 @@ def main():
         df["Clean"]       = df["Name"].apply(clean)
         for col in ["v1","v2","v3","v4","v5"]:
             cap = col.upper()
-            df[cap] = pd.to_datetime(df[col], errors="coerce") if col in df.columns else pd.NaT
+            df[cap] = to_dt(df[col]) if col in df.columns else pd.NaT
         return df
 
     fac_df = _load_fac()
