@@ -214,13 +214,16 @@ FACULTY_DATE_CAP_RAW: dict = {
     # Even Sem 2025-26 entry removed (S. Balamurli, before 15-May-2026)
 }
 
-# ── Per-faculty duty count overrides ─────────────────────────────────────────
-# Balamurli excluded (0 duties); his 4 duties redistributed:
-# 2 to Sudhakar S, 2 to N. Arun Kumar (each gets 4 regular + 2 extra = 6)
+# ── Per-faculty duty count overrides (Odd Sem 2026-27) ───────────────────────
+# All other TA/RA: 4 duties, 12 willingness options (via DESIG_RULES / DUTY_STRUCTURE)
 FACULTY_DUTY_OVERRIDE_RAW: dict = {
-    "S. Balamurli":  0,   # excluded from allotment — redistributed below
-    "Sudhakar S":    6,   # 4 regular + 2 from Balamurli
-    "N. Arun Kumar": 6,   # 4 regular + 2 from Balamurli
+    "MOHAMMED SAID, UY":   3,   # RS779
+    "Shri. P. Vijay Guru": 3,   # RS937
+}
+# Willingness options to select, per faculty (overrides DUTY_STRUCTURE)
+FACULTY_WILL_OVERRIDE_RAW: dict = {
+    "MOHAMMED SAID, UY":   9,   # RS779 — 3 duties
+    "Shri. P. Vijay Guru": 9,   # RS937 — 3 duties
 }
 
 # ── Forced date assignments (specific faculty MUST get these slots) ─────────
@@ -242,7 +245,7 @@ FACULTY_DESIG_OVERRIDE_RAW: dict = {
     "Dr. Anjan Kumar Dash": "P",   # faculty_id C870 — DB already has 'professor'
     # Add more if needed: "Name": "ACP"
 }
-DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 11, "RA": 11}
+DUTY_STRUCTURE = {"P": 3, "ACP": 6, "SAP": 6, "AP3": 9, "AP2": 9, "TA": 12, "RA": 12}
 
 # ── Willingness match scores ──────────────────────────────────── #
 W_EXACT      = 100_000
@@ -558,6 +561,9 @@ FACULTY_DATE_CAP: dict = {
 FACULTY_DUTY_OVERRIDE: dict = {
     _norm_name(k): v for k, v in FACULTY_DUTY_OVERRIDE_RAW.items()
 }
+FACULTY_WILL_OVERRIDE: dict = {
+    _norm_name(k): v for k, v in FACULTY_WILL_OVERRIDE_RAW.items()
+}
 
 # Build forced assignments with _norm_name keys and parsed dates
 import datetime as _dt_mod
@@ -577,24 +583,11 @@ FACULTY_VALUATION_OVERRIDE = {
 }
 
 # ── TA/RA duty-count group (4 or 5 duties, may select Saturday dates) ── #
-_SAT_PREASSIGN_RAW = [
-    "Shri Sangeethkumar Gopaldas", "Shri S. Antony", "Shri S. Balamurli",
-    "Shri R. Rajesh", "Shri. P. Vijay Guru", "Shri E. Ezekiel",
-    "Shri S. Balaganesh", "Shri S. Varadharajan", "Ms S. Kiruba Kari",
-    "Shri V. Adhavan", "Ms. P. Abirami", "Shri V. Ramesh Srenyvasan",
-    "Shri P. Panneerselvam", "Shri S. Sabrish", "Shri S. Manikandan",
-    "Shri P. Sarathkumar", "Shri C. Frizil Kinsly", "Shri Sudhakar S",
-    "Shri N. Arun Kumar",
-]
+_SAT_PREASSIGN_RAW: list = []   # Even Sem 2025-26 group retired; TA/RA now follow DESIG_RULES
 SAT_PREASSIGN_CLEAN = {_norm_name(n) for n in _SAT_PREASSIGN_RAW}
 
 # Faculty receiving 5 duties; all others in the list get 4 duties
-_FIVE_DUTY_RAW = [
-    "Shri C. Frizil Kinsly",
-    "Shri P. Sarathkumar",
-    "Shri S. Manikandan",
-    "Shri S. Sabrish",
-]
+_FIVE_DUTY_RAW: list = []   # none this semester
 FIVE_DUTY_CLEAN = {_norm_name(n) for n in _FIVE_DUTY_RAW}
 
 # Per-faculty exam dates — Research Scholars Course Work, Odd Sem 2026-27
@@ -762,6 +755,48 @@ def plan_faculty_sync(new: dict, existing_rows: list) -> dict:
     missing = [r for k, r in ex.items() if k not in new]
     return {"add": add, "update": upd, "missing": missing}
 
+
+def parse_slot_excel(f) -> list:
+    """Read a duty-slot Excel. Accepts either layout:
+      A) Date | Session (FN/AN) | Required
+      B) Date | FN | AN          (number of duties in each session)
+    Returns [{"duty_date": "YYYY-MM-DD", "session": "FN"/"AN", "required": n}, ...]"""
+    df = pd.read_excel(f)
+    df.columns = [str(c).strip() for c in df.columns]
+    up = {c: c.upper() for c in df.columns}
+    c_date = next((c for c in df.columns if "DATE" in up[c]), None)
+    c_sess = next((c for c in df.columns if "SESS" in up[c]), None)
+    c_req  = next((c for k in ("REQ", "DUT", "COUNT") for c in df.columns
+                   if k in up[c] and c not in (c_date, c_sess)), None)
+    c_fn   = next((c for c in df.columns if up[c] in ("FN", "FORENOON")), None)
+    c_an   = next((c for c in df.columns if up[c] in ("AN", "AFTERNOON")), None)
+    if not c_date:
+        raise ValueError("No 'Date' column found.")
+    out = {}
+    def _add(d, sess, n):
+        try:
+            n = int(float(n))
+        except Exception:
+            return
+        if n > 0:
+            key = (d, sess)
+            out[key] = out.get(key, 0) + n
+    for _, r in df.iterrows():
+        d = parse_date_safe(r[c_date])
+        if pd.isna(d):
+            continue
+        d = d.date()
+        if c_sess and c_req:
+            sn = normalize_session(r[c_sess])
+            if sn in ("FN", "AN"):
+                _add(d, sn, r[c_req])
+        elif c_fn or c_an:
+            if c_fn: _add(d, "FN", r[c_fn])
+            if c_an: _add(d, "AN", r[c_an])
+        else:
+            raise ValueError("Need either Session + Required columns, or FN / AN columns.")
+    return [{"duty_date": d.isoformat(), "session": sn, "required": n}
+            for (d, sn), n in sorted(out.items())]
 
 def normalize_session(v):
     t = str(v).strip().upper()
@@ -3011,6 +3046,61 @@ def page_admin(fac_df, offline_df, online_df):
         st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
 
         st.markdown("---")
+        st.markdown("#### 📅 Upload Duty Slots (Exam Schedule)")
+        st.caption("Upload the End-Semester duty requirement. Faculty can select willingness only "
+                   "on these dates. Uploading replaces ALL existing slots (including old semesters).")
+        _tmpl = io.BytesIO()
+        pd.DataFrame({"Date": ["16-11-2026", "17-11-2026"], "FN": [10, 12], "AN": [8, 9]}
+                     ).to_excel(_tmpl, index=False)
+        st.download_button("⬇ Template (Date | FN | AN)", data=_tmpl.getvalue(),
+                           file_name="Duty_Slots_Template.xlsx", key="dl_slot_tmpl")
+        _sf = st.file_uploader("Duty slot Excel (.xlsx)", type=["xlsx", "xls"], key="slot_upload")
+        if _sf:
+            try:
+                _slots = parse_slot_excel(_sf)
+            except Exception as _e:
+                st.error(f"Could not read the file: {_e}")
+                _slots = []
+            if _slots:
+                _out = [x for x in _slots
+                        if not _in_semester_window(x["duty_date"])]
+                _sdf = pd.DataFrame(_slots)
+                _sdf["Day"] = pd.to_datetime(_sdf["duty_date"]).dt.strftime("%a")
+                _sdf["Date"] = pd.to_datetime(_sdf["duty_date"]).dt.strftime("%d-%m-%Y")
+                _piv = (_sdf.pivot_table(index=["Date", "Day"], columns="session",
+                                         values="required", aggfunc="sum", fill_value=0)
+                        .reset_index())
+                _piv["_d"] = pd.to_datetime(_piv["Date"], format="%d-%m-%Y")
+                _piv = _piv.sort_values("_d").drop(columns="_d")
+                st.info(f"**{_sdf['duty_date'].nunique()}** exam days · **{len(_slots)}** sessions · "
+                        f"**{int(_sdf['required'].sum())}** total duties")
+                st.dataframe(_piv, use_container_width=True, hide_index=True)
+                if _out:
+                    st.error(f"❌ {len(_out)} row(s) are outside "
+                             f"{SEMESTER_CAL_START:%d-%m-%Y} – {SEMESTER_CAL_END:%d-%m-%Y}. "
+                             "Check the dates (DD-MM-YYYY) and upload again.")
+                elif st.button("✅ Replace Duty Slots", type="primary",
+                               use_container_width=True, key="btn_slot_upload"):
+                    _left = _db_delete_all("offline_duty")
+                    if _left:
+                        st.error(f"❌ Old slots could not be deleted ({_left} left). Run once in "
+                                 "Supabase → SQL Editor:")
+                        st.code('create policy "admin delete slots" on offline_duty for delete using (true);\n'
+                                'create policy "admin insert slots" on offline_duty for insert with check (true);',
+                                language="sql")
+                    else:
+                        try:
+                            _sb().table("offline_duty").insert(_slots).execute()
+                            st.cache_data.clear()
+                            _n = _db_count("offline_duty")
+                            if _n == len(_slots):
+                                st.success(f"✅ {_n} duty sessions uploaded. Faculty can now select dates.")
+                            else:
+                                st.error(f"❌ Only {_n} of {len(_slots)} sessions were saved.")
+                        except Exception as _e:
+                            st.error(f"❌ Upload failed: {_e}")
+
+        st.markdown("---")
         st.markdown("#### 🔄 Clear App Cache")
         st.caption("Forces a reload of faculty, slots, and willingness data from Supabase. "
                    "Use after updating designations in Supabase or after applying overrides.")
@@ -3151,7 +3241,9 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     val_s2    = set(val_d2)
     fn_clean  = _norm_name(sel_name)
     min_d, _  = fac_duty_range(sel_name, desig2)
-    if fn_clean in FIVE_DUTY_CLEAN:
+    if fn_clean in FACULTY_WILL_OVERRIDE:
+        req_cnt = FACULTY_WILL_OVERRIDE[fn_clean]
+    elif fn_clean in FIVE_DUTY_CLEAN:
         req_cnt = 12    # 4 specific TA: 5 duties → 12 willingness options
     elif fn_clean in SAT_PREASSIGN_CLEAN:
         req_cnt = 11    # First 13 TA + RA: 4 duties → 11 willingness options
@@ -3218,12 +3310,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
                      f"Raw value in DB: '{frow.get('designation', '?')}'. Contact admin.")
             return
         # Duty count: check explicit lists first, then DESIG_RULES
-        if fn_clean in FIVE_DUTY_CLEAN:
-            _duties_count = 5
-        elif fn_clean in SAT_PREASSIGN_CLEAN:
-            _duties_count = 4
-        else:
-            _duties_count = DESIG_RULES.get(desig2, DESIG_RULES["TA"])[0]
+        _duties_count = fac_duty_range(sel_name, desig2)[0]
         duties_label = str(_duties_count)
         st.write(f"**Duties to be Allotted:** {duties_label}")
         st.write(f"**Options to Select:** {req_cnt}")
