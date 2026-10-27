@@ -639,12 +639,43 @@ def _expand_exam_blackout(exam_dates: set, buffer: int = EXAM_BUFFER_DAYS) -> se
             expanded.add(_prev_working_day(d, step))
     return expanded
 
-# Per-faculty ALLOTMENT blackout = exam dates + n-1, n-2 working days before each exam date.
+# Lab examination duty — MEC103 Engineering Practices Laboratory (Odd Sem 2026-27)
+# Source: EPL_Lab_Exam_Timetable.pdf. The whole lab-exam day is blocked (FN + AN);
+# no buffer days. Names are as in the faculty master list.
+_D = datetime.date
+_FACULTY_LAB_DATES_RAW: dict = {
+    "Dr. S. Ramesh":             {_D(2026, 11, 30), _D(2026, 12, 3)},   # C1087
+    "Shri M. Tagore":            {_D(2026, 11, 30), _D(2026, 12, 4)},   # C1715
+    "Dr. K. Palaksha Reddy":     {_D(2026, 11, 30)},                    # C1591
+    "Dr. S. Krishnamani":        {_D(2026, 11, 30)},                    # C1903
+    "Shri J. Hari Vignesh":      {_D(2026, 12, 1), _D(2026, 12, 4)},    # C1789
+    "Dr. P.S. Sivasakthivel":    {_D(2026, 12, 1)},                     # C2210
+    "Dr. C.B. Maheswaran":       {_D(2026, 12, 1)},                     # C1840
+    "Dr. D.Venkatesan":          {_D(2026, 12, 1)},                     # C1606
+    "Dr. K. Thiruppathi":        {_D(2026, 12, 2)},                     # C809
+    "Dr. S. Ramesh Kumar":       {_D(2026, 12, 2)},                     # C2020
+    "Dr. G. Rajamohan":          {_D(2026, 12, 2)},                     # C2191
+    "Dr. Naveen Kumar A":        {_D(2026, 12, 2)},                     # C2620 (timetable: A. Naveen Kumar)
+    "Shri R. Jayendra Bharathi": {_D(2026, 12, 3), _D(2026, 12, 4)},    # C1824
+    "Dr. T.Ashok Kumar":         {_D(2026, 12, 3), _D(2026, 12, 4)},    # C479
+    "Dr. P. Raja":               {_D(2026, 12, 3)},                     # C482
+    "Dr. Subin P George":        {_D(2026, 12, 4)},                     # C2571
+}
+del _D
+FACULTY_LAB_DATES_CLEAN: dict = {
+    _exam_key(k): v for k, v in _FACULTY_LAB_DATES_RAW.items()
+}
+
+# Per-faculty ALLOTMENT blackout =
+#   scholar exam dates + n-1, n-2 working days before each exam date
+#   + lab examination duty days (no buffer).
 # These dates are fully blocked from the willingness selector AND the optimizer.
 FACULTY_BLACKOUT_CLEAN: dict = {
     fc: _expand_exam_blackout(dates)
     for fc, dates in FACULTY_EXAM_DATES_CLEAN.items()
 }
+for _fc, _dates in FACULTY_LAB_DATES_CLEAN.items():
+    FACULTY_BLACKOUT_CLEAN.setdefault(_fc, set()).update(_dates)
 
 
 def fac_duty_range(fn: str, desig: str) -> tuple:
@@ -1205,7 +1236,8 @@ def render_deviation_section(allot_rows: pd.DataFrame, will_set: set):
 # ═══════════════════════════════════════════════════════════════ #
 #                    CALENDAR HEATMAP                            #
 # ═══════════════════════════════════════════════════════════════ #
-def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_blocked_dates=None):
+def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=None, sat_blocked_dates=None,
+                    lab_dates=None):
     st.markdown(f"#### {title}")
     if duty_df is None or duty_df.empty or "Date" not in duty_df.columns:
         st.info("Duty slots not yet published — showing the semester calendar.")
@@ -1235,6 +1267,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
     val_set          = set(val_dates)
     exam_set         = set(exam_dates)         if exam_dates         else set()
     buffer_set       = set(buffer_dates)       if buffer_dates       else set()
+    lab_set          = set(lab_dates)          if lab_dates          else set()
     sat_blocked_set  = set(sat_blocked_dates)  if sat_blocked_dates  else set()
     WD_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -1246,6 +1279,10 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         "<span style='background:#ffedd5;border:1px solid #fdba74;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>⛔ Buffer Day (n−1, n−2)</span>"
     ) if buffer_set else ""
+    _lab_legend = (
+        "<span style='background:#ede9fe;border:1px solid #c4b5fd;border-radius:4px;"
+        "padding:2px 8px;margin-right:6px'>🧪 Lab Exam Duty (Locked)</span>"
+    ) if lab_set else ""
     _sat_blk_legend = (
         "<span style='background:#f1f5f9;border:1px solid #94a3b8;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🚷 Saturday (Not available)</span>"
@@ -1254,7 +1291,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
         "<span style='font-size:.82rem'>"
         "<span style='background:#fce7f3;border:1px solid #f9a8d4;border-radius:4px;"
         "padding:2px 8px;margin-right:6px'>🩷 Valuation Locked</span>"
-        + _sat_blk_legend + _exam_legend + _buf_legend +
+        + _sat_blk_legend + _exam_legend + _lab_legend + _buf_legend +
         "<span style='background:#fff;border:1px solid #cbd5e1;border-radius:4px;"
         "padding:2px 8px'>🔢 Number = duties required on that day/session</span>"
         "</span>", unsafe_allow_html=True)
@@ -1309,6 +1346,9 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                     elif is_exam:
                         bg, color = "#fee2e2", "#dc2626"
                         label = f"{dt.day} 🚫"
+                    elif dt in lab_set:
+                        bg, color = "#ede9fe", "#6d28d9"
+                        label = f"{dt.day} 🧪"
                     elif is_buffer:
                         bg, color = "#ffedd5", "#c2410c"
                         label = f"{dt.day} ⛔"
@@ -1342,6 +1382,8 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
                             bg, content = "#fce7f3", ""
                         elif is_exam:
                             bg, content = "#fee2e2", ""
+                        elif dt in lab_set:
+                            bg, content = "#ede9fe", ""
                         elif is_buffer:
                             bg, content = "#ffedd5", ""
                         elif is_sat_blk_row:
@@ -3108,6 +3150,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     sopts["DateOnly"] = sopts["Date"].dt.date
     fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(_exam_key(sel_name), set())
     fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(_exam_key(sel_name), set())
+    fac_lab_dates      = FACULTY_LAB_DATES_CLEAN.get(_exam_key(sel_name), set())
 
     # Saturdays are open to all designations this semester (optional)
     _sat_blocked_desig = False
@@ -3167,13 +3210,31 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.write(f"**Duties to be Allotted:** {duties_label}")
         st.write(f"**Options to Select:** {req_cnt}")
 
+        # Lab examination duty notice
+        if fac_lab_dates:
+            _lab_list = " &nbsp;·&nbsp; ".join(
+                f"<b>{d.strftime('%d-%m-%Y (%A)')}</b>" for d in sorted(fac_lab_dates))
+            st.markdown(f"""
+<div style="background:#f5f3ff;border:2px solid #8b5cf6;border-radius:12px;
+            padding:12px 16px;margin:8px 0 12px 0">
+  <div style="font-size:.93rem;font-weight:800;color:#5b21b6">
+    🧪 Lab Examination Duty — Dates Locked
+  </div>
+  <div style="font-size:.84rem;color:#4c1d95;margin-top:5px">
+    You are an examiner for the MEC103 Engineering Practices Laboratory examination on: {_lab_list}
+  </div>
+  <div style="font-size:.78rem;color:#6d28d9;margin-top:6px;border-top:1px solid #ddd6fe;padding-top:5px">
+    These dates are excluded from willingness selection and End-Semester duty allotment.
+  </div>
+</div>""", unsafe_allow_html=True)
+
         # Exam date notice (only for faculty with exam dates)
         if fac_exam_dates:
             _exam_rows = "".join(
                 f"<li style='margin:3px 0'><b>{d.strftime('%d-%m-%Y (%A)')}</b></li>"
                 for d in sorted(fac_exam_dates)
             )
-            _buf_dates = fac_blackout_dates - fac_exam_dates
+            _buf_dates = fac_blackout_dates - fac_exam_dates - fac_lab_dates
             _buf_rows  = "".join(
                 f"<li style='margin:3px 0'>{d.strftime('%d-%m-%Y (%A)')} (buffer)</li>"
                 for d in sorted(_buf_dates)
@@ -3200,33 +3261,31 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
   </div>
 </div>""", unsafe_allow_html=True)
 
-        # Saturday duty note — open to all designations (optional)
-        if _all_sat_dates:
-            _sat_list = " &nbsp;·&nbsp; ".join(
-                f"<b>{d.strftime('%d-%m-%Y')}</b>" for d in sorted(_all_sat_dates)
-            )
-            _sat_rule = (
-                "As a TA/RA, you may be allotted Saturday duties as per the usual practice."
-                if desig2 in SAT_ALWAYS_DESIG else
-                "Saturday duty is <b>optional</b> for your designation. You will be allotted a "
-                "Saturday <b>only if you select that Saturday</b> in your willingness. "
-                "If you do not select any Saturday, no Saturday duty will be assigned to you."
-            )
-            st.markdown(f"""
+        # Saturday duty notice — open to all designations (shown to everyone)
+        _sat_list = (" &nbsp;·&nbsp; ".join(
+            f"<b>{d.strftime('%d-%m-%Y')}</b>" for d in sorted(_all_sat_dates))
+            if _all_sat_dates else "will be shown once the examination schedule is published")
+        _sat_rule = (
+            "As per the usual practice, TA/RA members may be allotted Saturday duties."
+            if desig2 in SAT_ALWAYS_DESIG else
+            "Saturday duty will be allotted <b>only</b> to faculty members who include "
+            "the respective Saturday in their willingness."
+        )
+        st.markdown(f"""
 <div style="background:#eff6ff;border:2px solid #60a5fa;border-radius:12px;
             padding:12px 16px;margin:8px 0 12px 0">
   <div style="font-size:.93rem;font-weight:800;color:#1e3a8a">
-    📅 Saturday Duty — Open to All Designations (Optional)
+    📢 Notice: Saturday Examination Duty
   </div>
-  <div style="font-size:.83rem;color:#1e40af;margin-top:5px">
-    For this semester, Saturday examination duties are open to faculty of all designations.
-    Faculty members who are willing to take up Saturday duty may include Saturday option(s)
-    in their willingness submission.
+  <div style="font-size:.84rem;color:#1e40af;margin-top:6px;line-height:1.5">
+    For the Odd Semester 2026-27 End-Semester Examinations, Saturday duties are
+    <b>open to faculty members of all designations</b>. Interested faculty members
+    may kindly include Saturday(s) in their willingness options.
   </div>
   <div style="font-size:.82rem;color:#1e3a8a;margin-top:6px">{_sat_rule}</div>
-  <div style="font-size:.82rem;color:#475569;margin-top:6px;
+  <div style="font-size:.8rem;color:#475569;margin-top:6px;
               border-top:1px solid #bfdbfe;padding-top:6px">
-    Saturday dates in this examination: {_sat_list}
+    Saturday examination dates: {_sat_list}
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -3366,7 +3425,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         # All designations see the Offline Duty Calendar this semester
         render_calendar(offline_df, val_s2, "Offline Duty Calendar",
                         exam_dates=fac_exam_dates,
-                        buffer_dates=(fac_blackout_dates - fac_exam_dates),
+                        buffer_dates=(fac_blackout_dates - fac_exam_dates - fac_lab_dates),
+                        lab_dates=fac_lab_dates,
                         sat_blocked_dates=(_all_sat_dates if _sat_blocked_desig else set()))
 
 
