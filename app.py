@@ -77,6 +77,10 @@ SEMESTER_CAL_START = datetime.date(2026, 11, 1)
 SEMESTER_CAL_END   = datetime.date(2026, 12, 31)
 # Scholar exam rule: exam day + this many working days before it are blocked
 EXAM_BUFFER_DAYS   = 2
+# Saturday duty: open to ALL designations this semester (optional / willingness-based).
+# TA/RA can be allotted any Saturday (as before); other designations are allotted
+# a Saturday ONLY if they themselves selected that Saturday in their willingness.
+SAT_ALWAYS_DESIG   = {"TA", "RA"}
 
 FACULTY_FILE      = "Faculty_Master.xlsx"
 OFFLINE_FILE      = "Offline_Duty.xlsx"
@@ -336,9 +340,19 @@ def db_validate_reset_token(token: str):
 def db_consume_reset_token(token: str):
     _sb().table("password_reset_tokens").update({"used": True}).eq("token", token).execute()
 
+def _in_semester_window(v) -> bool:
+    try:
+        d = pd.to_datetime(str(v).strip()[:10], errors="coerce")
+        return pd.notna(d) and SEMESTER_CAL_START <= d.date() <= SEMESTER_CAL_END
+    except Exception:
+        return False
+
 def db_get_offline_slots():
+    """Offline slots for the CURRENT semester only (Nov–Dec 2026).
+    Old-semester rows still in Supabase (e.g. May/Jun 2026) are ignored everywhere:
+    calendar, date selector, exam-period banner and optimizer."""
     r = _sb().table("offline_duty").select("*").execute()
-    return r.data or []
+    return [row for row in (r.data or []) if _in_semester_window(row.get("duty_date"))]
 
 def db_get_online_slots():
     return []          # No online duty this semester
@@ -1101,13 +1115,14 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
     duty_df["Date"] = pd.to_datetime(duty_df["Date"], errors="coerce")
     duty_df = duty_df.dropna(subset=["Date"])
 
-    # Months to show = full semester window (Nov–Dec 2026) + any slot months outside it
+    duty_df = duty_df[(duty_df["Date"].dt.date >= SEMESTER_CAL_START) &
+                      (duty_df["Date"].dt.date <= SEMESTER_CAL_END)]
+    # Months to show = semester window only (Nov–Dec 2026)
     months = set()
     _m = datetime.date(SEMESTER_CAL_START.year, SEMESTER_CAL_START.month, 1)
     while _m <= SEMESTER_CAL_END:
         months.add((_m.year, _m.month))
         _m = (_m.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
-    months |= {(d.year, d.month) for d in duty_df["Date"]}
     months = sorted(months)
 
     if duty_df.empty:
@@ -1132,7 +1147,7 @@ def render_calendar(duty_df, val_dates, title, exam_dates=None, buffer_dates=Non
     ) if buffer_set else ""
     _sat_blk_legend = (
         "<span style='background:#f1f5f9;border:1px solid #94a3b8;border-radius:4px;"
-        "padding:2px 8px;margin-right:6px'>🚷 Saturday (Not for your designation)</span>"
+        "padding:2px 8px;margin-right:6px'>🚷 Saturday (Not available)</span>"
     ) if sat_blocked_set else ""
     st.markdown(
         "<span style='font-size:.82rem'>"
@@ -1335,7 +1350,17 @@ def _load_core(log):
     log(f"  Seats needed   : {sum(s['required'] for s in ALL_S)}")
     log(f"  Willingness    : {len(submitted)} submitted | {len(non_sub)} not submitted")
 
-    SAT_DESIG = {"TA", "RA"}
+    SAT_DESIG = set(SAT_ALWAYS_DESIG)   # always Saturday-eligible (TA/RA)
+    # Other designations: Saturday only where the faculty opted in via willingness
+    sat_willing = defaultdict(set)
+    if not wdf.empty:
+        for _, _wr in wdf.iterrows():
+            _wd = _wr["Date"].date()
+            if _wd.weekday() == 5:
+                sat_willing[str(_wr["Faculty"]).strip()].add(_wd)
+
+    def sat_ok(fn, d2, date):
+        return d2 in SAT_DESIG or date in sat_willing.get(fn, set())
     sap_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "SAP"]
     sap_fallback = sap_faculty[:2]
     acp_faculty  = [n for n in ALL_FAC if fac_d.get(n) == "ACP"]
@@ -1351,7 +1376,7 @@ def _load_core(log):
             allowed = DESIG_RULES[d2][2]
             if sl["type"] not in allowed: continue
             if sl["date"] in fac_val.get(fn, set()): continue
-            if sl["date"].weekday() == 5 and d2 not in SAT_DESIG: continue
+            if sl["date"].weekday() == 5 and not sat_ok(fn, d2, sl["date"]): continue
             avail += 1
         if avail < sl["required"]:
             ds = sl["date"].strftime("%d-%m-%Y")
@@ -1434,7 +1459,7 @@ def _load_core(log):
         # Per-faculty date cap (duties must be before specified date)
         if _norm_name(fn) in FACULTY_DATE_CAP and sl["date"] >= FACULTY_DATE_CAP[_norm_name(fn)]:
             return False
-        if sl["date"].weekday() == 5 and d2 not in SAT_DESIG:              return False
+        if sl["date"].weekday() == 5 and not sat_ok(fn, d2, sl["date"]):  return False
         return True
 
     # ── Per-faculty duty ranges ───────────────────────────────────────
@@ -2883,8 +2908,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
     fac_blackout_dates = FACULTY_BLACKOUT_CLEAN.get(_exam_key(sel_name), set())
     fac_exam_dates     = FACULTY_EXAM_DATES_CLEAN.get(_exam_key(sel_name), set())
 
-    # Determine if this designation is NOT allowed on Saturdays
-    _sat_blocked_desig = desig2 not in {"TA", "RA"}
+    # Saturdays are open to all designations this semester (optional)
+    _sat_blocked_desig = False
 
     # Saturday dates in the slot list — used for calendar highlight + selector filter
     _all_sat_dates = {d for d in sopts["DateOnly"].dropna().unique() if d.weekday() == 5}
@@ -2893,7 +2918,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         d for d in sopts["DateOnly"].dropna().unique()
         if d not in val_s2
         and d not in fac_blackout_dates
-        and not (_sat_blocked_desig and d.weekday() == 5)   # block Saturdays for P/ACP/SAP/AP3/AP2
+        and not (_sat_blocked_desig and d.weekday() == 5)
     ])
 
     if st.session_state.selected_faculty != sel_clean:
@@ -2974,24 +2999,33 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
   </div>
 </div>""", unsafe_allow_html=True)
 
-        # Saturday blocked notice for non-TA/RA designations
-        if _sat_blocked_desig and _all_sat_dates:
+        # Saturday duty note — open to all designations (optional)
+        if _all_sat_dates:
             _sat_list = " &nbsp;·&nbsp; ".join(
                 f"<b>{d.strftime('%d-%m-%Y')}</b>" for d in sorted(_all_sat_dates)
             )
+            _sat_rule = (
+                "As a TA/RA, you may be allotted Saturday duties as per the usual practice."
+                if desig2 in SAT_ALWAYS_DESIG else
+                "Saturday duty is <b>optional</b> for your designation. You will be allotted a "
+                "Saturday <b>only if you select that Saturday</b> in your willingness. "
+                "If you do not select any Saturday, no Saturday duty will be assigned to you."
+            )
             st.markdown(f"""
-<div style="background:#f1f5f9;border:2px solid #94a3b8;border-radius:12px;
+<div style="background:#eff6ff;border:2px solid #60a5fa;border-radius:12px;
             padding:12px 16px;margin:8px 0 12px 0">
-  <div style="font-size:.93rem;font-weight:800;color:#334155">
-    🚷 Saturday Duties — Not Applicable for Your Designation
+  <div style="font-size:.93rem;font-weight:800;color:#1e3a8a">
+    📅 Saturday Duty — Open to All Designations (Optional)
   </div>
-  <div style="font-size:.83rem;color:#475569;margin-top:5px">
-    Saturdays are reserved for TA/RA faculty only.
-    The following dates are <b>excluded</b> from your date selector and will not be allotted to you:
+  <div style="font-size:.83rem;color:#1e40af;margin-top:5px">
+    For this semester, Saturday examination duties are open to faculty of all designations.
+    Faculty members who are willing to take up Saturday duty may include Saturday option(s)
+    in their willingness submission.
   </div>
-  <div style="font-size:.82rem;color:#64748b;margin-top:6px;
-              border-top:1px solid #cbd5e1;padding-top:6px">
-    {_sat_list}
+  <div style="font-size:.82rem;color:#1e3a8a;margin-top:6px">{_sat_rule}</div>
+  <div style="font-size:.82rem;color:#475569;margin-top:6px;
+              border-top:1px solid #bfdbfe;padding-top:6px">
+    Saturday dates in this examination: {_sat_list}
   </div>
 </div>""", unsafe_allow_html=True)
 
