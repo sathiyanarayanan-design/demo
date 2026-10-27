@@ -381,11 +381,44 @@ def db_submit_willingness(fid: str, faculty_name: str, slots: list):
              "duty_date": _to_iso(s["Date"]), "session": s["Session"]} for s in slots]
     if rows: _sb().table("willingness").insert(rows).execute()
 
-def db_clear_all_willingness():
-    _sb().table("willingness").delete().neq("id", 0).execute()
+def _db_count(table: str, **eq) -> int:
+    q = _sb().table(table).select("*", count="exact")
+    for k, v in eq.items():
+        q = q.eq(k, v)
+    r = q.limit(1).execute()
+    return int(r.count or 0)
+
+def _db_delete_all(table: str) -> int:
+    """Delete every row of `table`. Works whether `id` is an integer or a UUID.
+    Returns the number of rows STILL present afterwards (0 = success).
+    A non-zero result almost always means Supabase Row Level Security has no
+    DELETE policy for this key — Supabase then silently deletes nothing."""
+    _sb().table(table).delete().not_.is_("id", "null").execute()
+    return _db_count(table)
+
+def db_clear_all_willingness() -> int:
+    return _db_delete_all("willingness")
+
+def db_delete_willingness_for(fid: str) -> int:
+    """Delete one faculty's willingness. Returns rows still present (0 = success)."""
+    _sb().table("willingness").delete().eq("faculty_id", fid).execute()
+    return _db_count("willingness", faculty_id=fid)
+
+def db_clear_allocation() -> int:
+    return _db_delete_all("final_allocation")
+
+_RLS_HELP = (
+    "Supabase did not delete the rows — this is a Row Level Security (RLS) block, "
+    "not an app error. Fix once in Supabase → SQL Editor:\n\n"
+    "```sql\n"
+    "create policy \"admin delete willingness\" on willingness for delete using (true);\n"
+    "create policy \"admin delete allocation\"  on final_allocation for delete using (true);\n"
+    "```\n"
+    "Or put the **service_role** key in SUPABASE_KEY (Streamlit secrets)."
+)
 
 def db_save_allocation(records: list):
-    _sb().table("final_allocation").delete().neq("id", 0).execute()
+    _db_delete_all("final_allocation")
     if records: _sb().table("final_allocation").insert(records).execute()
 
 def db_get_allocation_for(fid: str):
@@ -628,6 +661,74 @@ def fac_duty_range(fn: str, desig: str) -> tuple:
         return 4, 4
     dr = DESIG_RULES.get(desig, DESIG_RULES["TA"])
     return dr[0], dr[1]
+
+
+# ═══════════════════════════════════════════════════════════════ #
+#        FACULTY / SCHOLAR LIST SYNC  (Excel → Supabase)          #
+# ═══════════════════════════════════════════════════════════════ #
+def _find_col(df, *keys, exclude=()):
+    for c in df.columns:
+        cu = str(c).upper()
+        if all(k in cu for k in keys) and not any(x in cu for x in exclude):
+            return c
+    return None
+
+def parse_faculty_excels(files) -> dict:
+    """Read one or more uploaded Excel files and return {faculty_id: {...}}.
+    Understands both formats:
+      • Faculty list : S.No. | ID No. | NAME OF STAFF | Designation
+      • Scholar list : Sl.No | Code | Name | Designation (TA/RA) | Mobile number | Official mail id
+    Later files fill in email / mobile for IDs already read."""
+    out = {}
+    for f in files:
+        df = pd.read_excel(f, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        c_id   = (_find_col(df, "ID", "NO") or _find_col(df, "CODE")
+                  or _find_col(df, "ID", exclude=("MAIL",)))
+        c_name = _find_col(df, "NAME")
+        c_des  = _find_col(df, "DESIG")
+        c_mail = _find_col(df, "MAIL")
+        c_mob  = _find_col(df, "MOBILE") or _find_col(df, "PHONE")
+        if not (c_id and c_name):
+            raise ValueError(f"{getattr(f, 'name', 'file')}: could not find ID/Code and Name columns.")
+        for _, r in df.iterrows():
+            fid = _norm_id(r.get(c_id, ""))
+            nm  = " ".join(str(r.get(c_name, "")).split())
+            if not fid or fid in ("NAN", "NONE") or not nm or nm.lower() == "nan":
+                continue
+            rec = out.setdefault(fid, {"faculty_id": fid})
+            rec.setdefault("name", nm)
+            if c_des and str(r.get(c_des, "")).strip().lower() not in ("", "nan"):
+                rec.setdefault("designation", str(r[c_des]).strip())
+            if c_mail and str(r.get(c_mail, "")).strip().lower() not in ("", "nan", "na"):
+                rec["email"] = str(r[c_mail]).strip().lower()
+            if c_mob and str(r.get(c_mob, "")).strip().lower() not in ("", "nan", "na"):
+                rec["mobile"] = str(r[c_mob]).strip().split(".")[0]
+    return out
+
+def plan_faculty_sync(new: dict, existing_rows: list) -> dict:
+    """Compare Excel vs Supabase. Returns add / update / missing lists."""
+    ex = {_norm_id(r["faculty_id"]): r for r in existing_rows}
+    cols = set().union(*[set(r.keys()) for r in existing_rows]) if existing_rows else set()
+    mob_col = next((c for c in ("mobile", "mobile_number", "phone", "phone_number") if c in cols), None)
+    add, upd = [], []
+    for fid, rec in new.items():
+        fields = {"name": rec["name"]}
+        if rec.get("designation"):
+            fields["designation"] = rec["designation"]
+        if rec.get("email") and (not existing_rows or "email" in cols):
+            fields["email"] = rec["email"]
+        if rec.get("mobile") and mob_col:
+            fields[mob_col] = rec["mobile"]
+        if fid not in ex:
+            add.append({"faculty_id": fid, **fields})
+        else:
+            cur = ex[fid]
+            diff = {k: v for k, v in fields.items() if str(cur.get(k) or "").strip() != str(v)}
+            if diff:
+                upd.append({"faculty_id": fid, "old_name": cur.get("name"), **diff})
+    missing = [r for k, r in ex.items() if k not in new]
+    return {"add": add, "update": upd, "missing": missing}
 
 
 def normalize_session(v):
@@ -2336,10 +2437,14 @@ def page_admin(fac_df, offline_df, online_df):
             if st.button("🗑 Delete All Willingness", type="primary",
                          use_container_width=True, key="btn_del_will"):
                 if st.session_state.get("confirm_delete_will"):
-                    db_clear_all_willingness()
-                    st.success("✅ All willingness deleted.")
-                    del st.session_state["confirm_delete_will"]
-                    st.rerun()
+                    _left = db_clear_all_willingness()
+                    if _left:
+                        st.error(f"❌ {_left} willingness row(s) could not be deleted.")
+                        st.markdown(_RLS_HELP)
+                    else:
+                        st.success("✅ All willingness deleted.")
+                        del st.session_state["confirm_delete_will"]
+                        st.rerun()
                 else:
                     st.error("Tick the confirmation checkbox first.")
 
@@ -2349,12 +2454,42 @@ def page_admin(fac_df, offline_df, online_df):
             if st.button("🗑 Delete All Allotment", type="primary",
                          use_container_width=True, key="btn_del_allot"):
                 if st.session_state.get("confirm_delete_allot"):
-                    _sb().table("final_allocation").delete().neq("id", 0).execute()
-                    st.success("✅ All allotment records deleted.")
-                    del st.session_state["confirm_delete_allot"]
-                    st.rerun()
+                    _left = db_clear_allocation()
+                    if _left:
+                        st.error(f"❌ {_left} allotment row(s) could not be deleted.")
+                        st.markdown(_RLS_HELP)
+                    else:
+                        st.success("✅ All allotment records deleted.")
+                        del st.session_state["confirm_delete_allot"]
+                        st.rerun()
                 else:
                     st.error("Tick the confirmation checkbox first.")
+
+        st.markdown("---")
+        st.markdown("**Delete One Faculty's Willingness** (e.g. test entries)")
+        _wrows = db_get_all_willingness_rows()
+        _wfac = {}
+        for _r in _wrows:
+            _k = str(_r.get("faculty_id", "")).strip()
+            if _k:
+                _nm, _c = _wfac.get(_k, (str(_r.get("faculty_name", "")).strip(), 0))
+                _wfac[_k] = (_nm, _c + 1)
+        if not _wfac:
+            st.caption("No willingness submissions in the database.")
+        else:
+            _opts = sorted(_wfac, key=lambda k: _wfac[k][0].lower())
+            _pick = st.selectbox(
+                "Select faculty", _opts, key="del_one_will_pick",
+                format_func=lambda k: f"{_wfac[k][0]} ({k}) — {_wfac[k][1]} option(s)")
+            if st.button("🗑 Delete This Faculty's Willingness",
+                         use_container_width=True, key="btn_del_one_will"):
+                _left = db_delete_willingness_for(_pick)
+                if _left:
+                    st.error(f"❌ {_left} row(s) could not be deleted.")
+                    st.markdown(_RLS_HELP)
+                else:
+                    st.success(f"✅ Willingness deleted for {_wfac[_pick][0]} ({_pick}).")
+                    st.rerun()
 
         st.markdown("---")
         st.markdown("**Full Reset — Delete Both Willingness & Allotment**")
@@ -2364,11 +2499,14 @@ def page_admin(fac_df, offline_df, online_df):
         if st.button("⚠ Full Reset (Willingness + Allotment)", type="primary",
                      use_container_width=True, key="btn_full_reset"):
             if st.session_state.get("confirm_full_reset"):
-                db_clear_all_willingness()
-                _sb().table("final_allocation").delete().neq("id", 0).execute()
-                st.success("✅ Full reset complete — all willingness and allotment records deleted.")
-                del st.session_state["confirm_full_reset"]
-                st.rerun()
+                _left = db_clear_all_willingness() + db_clear_allocation()
+                if _left:
+                    st.error(f"❌ {_left} row(s) could not be deleted.")
+                    st.markdown(_RLS_HELP)
+                else:
+                    st.success("✅ Full reset complete — all willingness and allotment records deleted.")
+                    del st.session_state["confirm_full_reset"]
+                    st.rerun()
             else:
                 st.error("Tick the confirmation checkbox first.")
 
@@ -2644,6 +2782,89 @@ def page_admin(fac_df, offline_df, online_df):
         acc_df = pd.DataFrame(acc_rows)
         acc_df.insert(0, "Sl.No", acc_df.index + 1)
         st.dataframe(acc_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.markdown("#### 📥 Update Faculty & Research Scholar List (Excel → Supabase)")
+        st.caption("Upload the faculty list and/or the research scholar list. "
+                   "Existing faculty keep their password, admin rights and valuation dates — "
+                   "only Name / Designation / Email / Mobile are updated. "
+                   f"New faculty get the default password **{DEFAULT_PASSWORD}** (forced change on first login).")
+        _up = st.file_uploader("Excel file(s)", type=["xlsx", "xls"],
+                               accept_multiple_files=True, key="fac_sync_upload")
+        if _up:
+            try:
+                _new = parse_faculty_excels(_up)
+            except Exception as _e:
+                st.error(f"Could not read the file: {_e}")
+                _new = {}
+            if _new:
+                _plan = plan_faculty_sync(_new, all_fac_rows)
+                _c1, _c2, _c3 = st.columns(3)
+                _c1.metric("New (to add)", len(_plan["add"]))
+                _c2.metric("Changed (to update)", len(_plan["update"]))
+                _c3.metric("In Supabase but not in Excel", len(_plan["missing"]))
+                if _plan["add"]:
+                    with st.expander(f"➕ {len(_plan['add'])} new faculty"):
+                        st.dataframe(pd.DataFrame(_plan["add"]), use_container_width=True, hide_index=True)
+                if _plan["update"]:
+                    with st.expander(f"✏️ {len(_plan['update'])} changes"):
+                        st.dataframe(pd.DataFrame(_plan["update"]), use_container_width=True, hide_index=True)
+                _del_ok = False
+                if _plan["missing"]:
+                    with st.expander(f"➖ {len(_plan['missing'])} not in the Excel"):
+                        st.dataframe(pd.DataFrame([{
+                            "ID No.": r["faculty_id"], "Name": r["name"],
+                            "Admin": "👑" if r.get("is_admin") else ""}
+                            for r in _plan["missing"]]), use_container_width=True, hide_index=True)
+                    _del_ok = st.checkbox(
+                        "Also remove these from Supabase (admins are never removed; "
+                        "their willingness/allotment rows are also deleted)", key="fac_sync_del")
+                if st.button("✅ Apply to Supabase", type="primary",
+                             use_container_width=True, key="btn_fac_sync"):
+                    _ok, _err = 0, []
+                    _h = hash_password(DEFAULT_PASSWORD)
+                    for _r in _plan["add"]:
+                        try:
+                            _sb().table("faculty").insert({**_r, "password_hash": _h,
+                                "must_change_pw": True, "is_admin": False}).execute()
+                            _ok += 1
+                        except Exception as _e:
+                            _err.append(f"Add {_r['faculty_id']}: {_e}")
+                    for _r in _plan["update"]:
+                        _f = {k: v for k, v in _r.items() if k not in ("faculty_id", "old_name")}
+                        try:
+                            _sb().table("faculty").update(_f).eq("faculty_id", _r["faculty_id"]).execute()
+                            _ok += 1
+                        except Exception as _e:
+                            _err.append(f"Update {_r['faculty_id']}: {_e}")
+                    if _del_ok:
+                        for _r in _plan["missing"]:
+                            if _r.get("is_admin"):
+                                continue
+                            try:
+                                for _t in ("willingness", "final_allocation"):
+                                    _sb().table(_t).delete().eq("faculty_id", _r["faculty_id"]).execute()
+                                _sb().table("faculty").delete().eq("faculty_id", _r["faculty_id"]).execute()
+                                _ok += 1
+                            except Exception as _e:
+                                _err.append(f"Remove {_r['faculty_id']}: {_e}")
+                    st.cache_data.clear()
+                    # verify against the database (RLS can silently ignore writes)
+                    _after = plan_faculty_sync(_new, db_get_all_faculty())
+                    _pending = len(_after["add"]) + len(_after["update"]) + (
+                        len([r for r in _after["missing"] if not r.get("is_admin")]) if _del_ok else 0)
+                    if _err:
+                        st.error("Some changes failed:\n\n" + "\n\n".join(_err[:10]))
+                    if _pending:
+                        st.error(f"❌ {_pending} change(s) did not reach Supabase. This is usually "
+                                 "Row Level Security on the `faculty` table — run the SQL below once, "
+                                 "or use the service_role key in SUPABASE_KEY.")
+                        st.code('create policy "admin insert faculty" on faculty for insert with check (true);\n'
+                                'create policy "admin update faculty" on faculty for update using (true);\n'
+                                'create policy "admin delete faculty" on faculty for delete using (true);',
+                                language="sql")
+                    else:
+                        st.success(f"✅ Faculty list updated in Supabase ({_ok} change(s) applied).")
 
         st.markdown("---")
         st.markdown("#### 🔑 Reset a Faculty's Password")
