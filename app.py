@@ -217,12 +217,12 @@ FACULTY_DATE_CAP_RAW: dict = {
 # ── Per-faculty duty count overrides (Odd Sem 2026-27) ───────────────────────
 # All other TA/RA: 4 duties, 12 willingness options (via DESIG_RULES / DUTY_STRUCTURE)
 FACULTY_DUTY_OVERRIDE_RAW: dict = {
-    "MOHAMMED SAID, UY":   3,   # RS779
+    "MOHAMMED SAID, UY":   3,   # RS799
     "Shri. P. Vijay Guru": 3,   # RS937
 }
 # Willingness options to select, per faculty (overrides DUTY_STRUCTURE)
 FACULTY_WILL_OVERRIDE_RAW: dict = {
-    "MOHAMMED SAID, UY":   9,   # RS779 — 3 duties
+    "MOHAMMED SAID, UY":   9,   # RS799 — 3 duties
     "Shri. P. Vijay Guru": 9,   # RS937 — 3 duties
 }
 
@@ -1038,11 +1038,13 @@ def get_all_willingness():
     return load_willingness()
 
 def save_submission(faculty_name, slots):
+    if st.session_state.get("_preview_fid"):
+        return   # admin preview never writes
     fid = st.session_state.get("_logged_fid", faculty_name)
     db_submit_willingness(fid, faculty_name, slots)
 
 def already_submitted(faculty_name: str) -> bool:
-    fid = st.session_state.get("_logged_fid", "")
+    fid = st.session_state.get("_preview_fid") or st.session_state.get("_logged_fid", "")
     if fid:
         return db_already_submitted(fid)
     wl = load_willingness()
@@ -2486,6 +2488,65 @@ def page_admin(fac_df, offline_df, online_df):
 
     # ── Tab 1: Willingness Records ──────────────────────────────── #
     with t1:
+        # ── Willingness submission status (who has / has not submitted) ──
+        st.markdown("### 📌 Willingness Submission Status")
+        _fac_rows = db_get_all_faculty()
+        _w_rows   = db_get_all_willingness_rows()
+        _wcnt = {}
+        for _r in _w_rows:
+            _k = _norm_id(_r.get("faculty_id", ""))
+            _wcnt[_k] = _wcnt.get(_k, 0) + 1
+        _stat = []
+        for _r in _fac_rows:
+            _nm   = str(_r.get("name", "")).strip()
+            _code = _map_desig(_r.get("designation", ""))
+            _need = FACULTY_WILL_OVERRIDE.get(_norm_name(_nm), DUTY_STRUCTURE.get(_code, 0))
+            _got  = _wcnt.get(_norm_id(_r.get("faculty_id", "")), 0)
+            _stat.append({
+                "ID No.": _r.get("faculty_id", ""), "Name": _nm,
+                "Designation": DESIG_FULL.get(_code, _code),
+                "Duties": fac_duty_range(_nm, _code)[0],
+                "Options Required": _need, "Options Submitted": _got,
+                "Status": ("❌ Not Submitted" if _got == 0 else
+                           "⚠ Incomplete" if _got < _need else "✅ Submitted"),
+            })
+        _sdf = pd.DataFrame(_stat)
+        if _sdf.empty:
+            st.info("No faculty found.")
+        else:
+            _order = {"❌ Not Submitted": 0, "⚠ Incomplete": 1, "✅ Submitted": 2}
+            _rank = {DESIG_FULL.get(c, c): i for i, c in
+                     enumerate(["P", "ACP", "SAP", "AP3", "AP2", "TA", "RA"])}
+            _sdf = (_sdf.assign(_o=_sdf["Status"].map(_order),
+                                _r=_sdf["Designation"].map(_rank).fillna(99))
+                        .sort_values(["_o", "_r", "Name"]).drop(columns=["_o", "_r"])
+                        .reset_index(drop=True))
+            _m1, _m2, _m3, _m4 = st.columns(4)
+            _m1.metric("Total", len(_sdf))
+            _m2.metric("✅ Submitted", int((_sdf["Status"] == "✅ Submitted").sum()))
+            _m3.metric("⚠ Incomplete", int((_sdf["Status"] == "⚠ Incomplete").sum()))
+            _m4.metric("❌ Not Submitted", int((_sdf["Status"] == "❌ Not Submitted").sum()))
+            _show = st.radio("Show", ["Not Submitted", "Incomplete", "Submitted", "All"],
+                             horizontal=True, key="will_status_filter")
+            _view = _sdf if _show == "All" else _sdf[_sdf["Status"].str.contains(_show)]
+            _view = _view.reset_index(drop=True)
+            _view.insert(0, "Sl.No", _view.index + 1)
+            st.dataframe(_view, use_container_width=True, hide_index=True)
+            _xb = io.BytesIO()
+            with pd.ExcelWriter(_xb, engine="openpyxl") as _xw:
+                for _sh, _flt in [("Not Submitted", "Not Submitted"), ("Incomplete", "Incomplete"),
+                                  ("Submitted", "✅ Submitted"), ("All", None)]:
+                    _d = _sdf if _flt is None else _sdf[_sdf["Status"].str.contains(_flt)]
+                    _d = _d.reset_index(drop=True)
+                    _d.insert(0, "Sl.No", _d.index + 1)
+                    _d.to_excel(_xw, sheet_name=_sh, index=False)
+            st.download_button(
+                "⬇ Download Status (Excel)", data=_xb.getvalue(),
+                file_name=f"Willingness_Status_{datetime.date.today():%d-%m-%Y}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_will_status")
+        st.markdown("---")
+
         st.markdown("### 📋 Willingness Records")
         st.caption("All willingness submitted by faculty via this portal.")
 
@@ -3157,7 +3218,8 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
                     wdisp.append(f"{fmt_day(d2)} - {str(s2).upper()}")
                     will_pairs.add((nd.date(), str(s2).upper()))
 
-    _logged_fid_allot = st.session_state.get("_logged_fid", "")
+    _logged_fid_allot = (st.session_state.get("_preview_fid")
+                         or st.session_state.get("_logged_fid", ""))
     _allot_db_rows    = db_get_allocation_for(_logged_fid_allot) if _logged_fid_allot else []
     idisp = []
     allot_pairs: set = set()
@@ -3280,7 +3342,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.session_state.selected_slots   = []
         st.session_state["picked_date"]   = valid_d[0] if valid_d else None
 
-    if "picked_date" not in st.session_state:
+    if st.session_state.get("picked_date") not in valid_d:
+        # stale value (e.g. page opened before slots were loaded) → reset
         st.session_state["picked_date"] = valid_d[0] if valid_d else None
 
     # Show exam period banner
@@ -3515,8 +3578,11 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         elif not is_already:
             st.info(f"Select {rem2} more option(s) to enable submission.")
 
+        _preview = bool(st.session_state.get("_preview_fid"))
+        if _preview:
+            st.info("👁 Admin preview — submission is disabled here.")
         if st.button("✅ Submit Willingness",
-                     disabled=(len(st.session_state.selected_slots) != req_cnt),
+                     disabled=(_preview or len(st.session_state.selected_slots) != req_cnt),
                      use_container_width=True):
             save_submission(sel_name, st.session_state.selected_slots)
             st.session_state.selected_slots = []
@@ -3606,8 +3672,42 @@ def main():
 
     # ── 6. Main panel routing ─────────────────────────────────────
     if is_admin:
-        menu = st.radio("Main Menu", ["User View", "Admin View"],
+        menu = st.radio("Main Menu", ["User View", "Admin View", "👁 View as Faculty"],
                         horizontal=True, key="panel_mode")
+        st.session_state["_preview_fid"] = ""
+        if menu == "👁 View as Faculty":
+            _all = db_get_all_faculty()
+            _opts = {f'{r["name"]} ({r["faculty_id"]})': r for r in
+                     sorted(_all, key=lambda r: str(r.get("name", "")).lower())}
+            _pick = st.selectbox("Select faculty to see exactly what they see", list(_opts),
+                                 key="preview_fac_pick")
+            _r = _opts[_pick]
+            _pname  = str(_r["name"]).strip()
+            _pmatch = fac_df[fac_df["Clean"] == clean(_pname)]
+            st.markdown(
+                "<div style='background:#fef9c3;border:2px solid #eab308;border-radius:10px;"
+                "padding:8px 14px;margin:6px 0 10px 0;font-weight:700;color:#713f12'>"
+                f"👁 Admin preview — viewing the portal as <u>{_pname}</u> "
+                f"({_r['faculty_id']}). Nothing can be submitted from here.</div>",
+                unsafe_allow_html=True)
+            if _pmatch.empty:
+                st.error("This faculty's record was not found in the loaded faculty list — "
+                         "this is exactly the error they would see. Click 'Clear All Cached Data' "
+                         "in Admin View and check their name/designation in Supabase.")
+            else:
+                st.session_state["_preview_fid"] = _norm_id(_r["faculty_id"])
+                _prow = _pmatch.iloc[0]
+                st.caption(f"Designation in portal: **{_prow['Designation']}** · "
+                           f"Raw in Supabase: **{_r.get('designation', '')}**")
+                _ptab = st.radio("Their view", ["Willingness", "My Allotment"],
+                                 horizontal=True, key="preview_tab")
+                if _ptab == "Willingness":
+                    page_willingness(fac_df, offline_df, online_df, _pname, _prow)
+                else:
+                    page_allotment(fac_df, _pname, clean(_pname), _prow, offline_df, online_df)
+            st.markdown("---")
+            st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
+            return
         if menu == "Admin View":
             page_admin(fac_df, offline_df, online_df)
             st.markdown("---")
