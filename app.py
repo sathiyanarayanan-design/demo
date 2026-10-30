@@ -217,12 +217,12 @@ FACULTY_DATE_CAP_RAW: dict = {
 # ── Per-faculty duty count overrides (Odd Sem 2026-27) ───────────────────────
 # All other TA/RA: 4 duties, 12 willingness options (via DESIG_RULES / DUTY_STRUCTURE)
 FACULTY_DUTY_OVERRIDE_RAW: dict = {
-    "MOHAMMED SAID, UY":   3,   # RS799
+    "MOHAMMED SAID, UY":   3,   # RS779
     "Shri. P. Vijay Guru": 3,   # RS937
 }
 # Willingness options to select, per faculty (overrides DUTY_STRUCTURE)
 FACULTY_WILL_OVERRIDE_RAW: dict = {
-    "MOHAMMED SAID, UY":   9,   # RS799 — 3 duties
+    "MOHAMMED SAID, UY":   9,   # RS779 — 3 duties
     "Shri. P. Vijay Guru": 9,   # RS937 — 3 duties
 }
 
@@ -426,417 +426,12 @@ def db_save_allocation(records: list):
     if records: _sb().table("final_allocation").insert(records).execute()
 
 def db_get_allocation_for(fid: str):
-    """Current-semester allotment only (old May/Jun rows are ignored)."""
     r = _sb().table("final_allocation").select("*").eq("faculty_id", fid).order("duty_date").execute()
-    return [x for x in (r.data or []) if _in_semester_window(x.get("duty_date"))]
-
-def db_get_all_allocation():
-    """Current-semester allotment only (old May/Jun rows are ignored)."""
-    r = _sb().table("final_allocation").select("*").order("duty_date").execute()
-    return [x for x in (r.data or []) if _in_semester_window(x.get("duty_date"))]
-
-# ═══════════════════════════════════════════════════════════════ #
-#        DUTY SWAP — MUTUAL ADJUSTMENT (admin-approved)           #
-# ═══════════════════════════════════════════════════════════════ #
-SWAP_OPEN_STATUSES = ("pending_partner", "pending_admin")
-SWAP_STATUS_LABEL = {
-    "pending_partner": "⏳ Waiting for partner",
-    "pending_admin":   "🕒 Waiting for approval",
-    "approved":        "✅ Approved — allotment updated",
-    "declined":        "❌ Declined by partner",
-    "rejected":        "⛔ Rejected by admin",
-    "cancelled":       "↩ Cancelled by requester",
-    "superseded":      "↪ Closed (duty changed by another swap)",
-}
-SWAP_LEVEL_LABEL = {
-    "perfect":  "🟢 Perfect match",
-    "good":     "🟡 Good match",
-    "possible": "⚪ Possible",
-}
-SWAP_TABLE_SQL = """create table if not exists duty_swaps (
-  id                   bigint generated always as identity primary key,
-  created_at           timestamptz default now(),
-  requester_id         text,  requester_name text,
-  req_alloc_id         text,  req_date date,  req_session text,
-  partner_id           text,  partner_name text,
-  partner_alloc_id     text,  partner_date date,  partner_session text,
-  match_level          text,
-  status               text default 'pending_admin',
-  partner_responded_at timestamptz,
-  admin_decided_at     timestamptz,
-  admin_note           text
-);
--- Needed only if Row Level Security is ON for these tables:
-create policy "swap read"   on duty_swaps for select using (true);
-create policy "swap insert" on duty_swaps for insert with check (true);
-create policy "swap update" on duty_swaps for update using (true);
-create policy "alloc update" on final_allocation for update using (true);"""
-
-def db_swaps_all() -> list:
-    r = _sb().table("duty_swaps").select("*").order("id", desc=True).execute()
     return r.data or []
 
-def db_swap_create(rec: dict):
-    _sb().table("duty_swaps").insert(rec).execute()
-
-def db_swap_update(swap_id, fields: dict):
-    _sb().table("duty_swaps").update(fields).eq("id", swap_id).execute()
-
-def _now_iso() -> str:
-    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-
-def _alloc_date(row):
-    d = parse_date_safe(row.get("duty_date"))
-    return d.date() if pd.notna(d) else None
-
-def _swap_people(fac_df) -> dict:
-    """fid → {name, desig, blocked:set(dates)} — valuation + scholar exam/buffer + lab."""
-    people = {}
-    for _, fr in fac_df.iterrows():
-        fid = _norm_id(fr.get("ID No.", ""))
-        nm  = str(fr.get("Name", "")).strip()
-        if not fid:
-            continue
-        blocked = set(valuation_dates_for(fr, nm))
-        blocked |= FACULTY_BLACKOUT_CLEAN.get(_exam_key(nm), set())
-        people[fid] = {"name": nm, "desig": str(fr.get("Designation", "")), "blocked": blocked}
-    return people
-
-def _busy_dates(allocs: list) -> dict:
-    """fid → {date: [alloc ids]}"""
-    busy = {}
-    for a in allocs:
-        d = _alloc_date(a)
-        if d:
-            busy.setdefault(_norm_id(a.get("faculty_id", "")), {}).setdefault(d, []).append(str(a.get("id")))
-    return busy
-
-def _can_take(fid, d, people, busy, giving_away_id) -> bool:
-    """Can `fid` take a duty on date d, after giving away alloc `giving_away_id`?"""
-    p = people.get(fid)
-    if p is None or d in p["blocked"]:
-        return False
-    others = [i for i in busy.get(fid, {}).get(d, []) if i != str(giving_away_id)]
-    return not others            # max one duty per day
-
-def _locked_alloc_ids(swaps: list) -> set:
-    ids = set()
-    for s in swaps:
-        if s.get("status") in SWAP_OPEN_STATUSES:
-            ids.add(str(s.get("req_alloc_id"))); ids.add(str(s.get("partner_alloc_id")))
-    return ids
-
-def _will_by_fid() -> dict:
-    out = {}
-    for r in db_get_all_willingness_rows():
-        d = parse_date_safe(r.get("duty_date"))
-        if pd.notna(d):
-            out.setdefault(_norm_id(r.get("faculty_id", "")), set()).add(
-                (d.date(), str(r.get("session", "")).strip().upper()))
-    return out
-
-def swap_candidates(my_fid, my_alloc, allocs, people, swaps, will) -> list:
-    """Easy-match list for one of my duties. Every result is rule-valid both ways."""
-    me    = _norm_id(my_fid)
-    d1    = _alloc_date(my_alloc)
-    s1    = str(my_alloc.get("session", "")).strip().upper()
-    today = datetime.date.today()
-    busy  = _busy_dates(allocs)
-    lock  = _locked_alloc_ids(swaps)
-    rank  = {"perfect": 0, "good": 1, "possible": 2}
-    out = []
-    for a in allocs:
-        b  = _norm_id(a.get("faculty_id", ""))
-        d2 = _alloc_date(a)
-        s2 = str(a.get("session", "")).strip().upper()
-        if b == me or d2 is None or d2 <= today or str(a.get("id")) in lock:
-            continue
-        if d2 == d1 and s2 == s1:
-            continue                                   # same slot — nothing to swap
-        if not _can_take(b, d1, people, busy, a.get("id")):
-            continue                                   # partner can't do my duty
-        if not _can_take(me, d2, people, busy, my_alloc.get("id")):
-            continue                                   # I can't do partner's duty
-        they_want = (d1, s1) in will.get(b, set())
-        i_want    = (d2, s2) in will.get(me, set())
-        lvl = "perfect" if (they_want and i_want) else "good" if (they_want or i_want) else "possible"
-        out.append({"level": lvl, "partner_id": b, "partner_name": people[b]["name"],
-                    "partner_desig": people[b]["desig"], "alloc": a, "date": d2, "session": s2,
-                    "_k": (rank[lvl], abs((d2 - d1).days), people[b]["name"].lower())})
-    return sorted(out, key=lambda x: x["_k"])
-
-def validate_swap(sw, allocs, people) -> str:
-    """'' if the swap is still valid on current data, else the reason."""
-    by_id = {str(a.get("id")): a for a in allocs}
-    ra, pa = by_id.get(str(sw["req_alloc_id"])), by_id.get(str(sw["partner_alloc_id"]))
-    if ra is None or pa is None:
-        return "One of the duties no longer exists in the allotment."
-    rq, pt = _norm_id(sw["requester_id"]), _norm_id(sw["partner_id"])
-    if _norm_id(ra.get("faculty_id")) != rq or _norm_id(pa.get("faculty_id")) != pt:
-        return "One of the duties has already changed hands."
-    busy = _busy_dates(allocs)
-    if not _can_take(pt, _alloc_date(ra), people, busy, pa.get("id")):
-        return f"{sw['partner_name']} is no longer free / eligible on {_alloc_date(ra):%d-%m-%Y}."
-    if not _can_take(rq, _alloc_date(pa), people, busy, ra.get("id")):
-        return f"{sw['requester_name']} is no longer free / eligible on {_alloc_date(pa):%d-%m-%Y}."
-    return ""
-
-def apply_swap(sw, fac_df) -> str:
-    """Admin approval: exchange the two allotment rows. Returns '' on success, else error."""
-    allocs = db_get_all_allocation()
-    people = _swap_people(fac_df)
-    err = validate_swap(sw, allocs, people)
-    if err:
-        return err
-    rq, pt = _norm_id(sw["requester_id"]), _norm_id(sw["partner_id"])
-    tag = f"Swap #{sw['id']}"
-    _sb().table("final_allocation").update({
-        "faculty_id": pt, "faculty_name": people[pt]["name"],
-        "designation": people[pt]["desig"], "allocated_by": tag,
-    }).eq("id", sw["req_alloc_id"]).execute()
-    _sb().table("final_allocation").update({
-        "faculty_id": rq, "faculty_name": people[rq]["name"],
-        "designation": people[rq]["desig"], "allocated_by": tag,
-    }).eq("id", sw["partner_alloc_id"]).execute()
-    # verify
-    chk = {str(a.get("id")): _norm_id(a.get("faculty_id")) for a in db_get_all_allocation()}
-    if chk.get(str(sw["req_alloc_id"])) != pt or chk.get(str(sw["partner_alloc_id"])) != rq:
-        return ("Supabase did not save the change (Row Level Security). Run once in SQL Editor: "
-                'create policy "alloc update" on final_allocation for update using (true);')
-    db_swap_update(sw["id"], {"status": "approved", "admin_decided_at": _now_iso()})
-    # close other open requests that involved either duty
-    ids = {str(sw["req_alloc_id"]), str(sw["partner_alloc_id"])}
-    for o in db_swaps_all():
-        if o["id"] != sw["id"] and o.get("status") in SWAP_OPEN_STATUSES and \
-           ({str(o.get("req_alloc_id")), str(o.get("partner_alloc_id"))} & ids):
-            db_swap_update(o["id"], {"status": "superseded"})
-    return ""
-
-def _duty_txt(d, s) -> str:
-    d = parse_date_safe(d)
-    return f"{d:%d-%m-%Y} ({d:%a}) {str(s).upper()}" if pd.notna(d) else f"{d} {s}"
-
-
-# ═══════════════════════════════════════════════════════════════ #
-#     FINAL ALLOTMENT — admin upload + export for authorities     #
-# ═══════════════════════════════════════════════════════════════ #
-_DESIG_RANK = {c: i for i, c in enumerate(["P", "ACP", "SAP", "AP3", "AP2", "TA", "RA"])}
-
-def _people_index(fac_df):
-    """Lookups to match an uploaded row to a faculty: by ID and by tolerant name key."""
-    by_id, by_key = {}, {}
-    for _, fr in fac_df.iterrows():
-        rec = {"fid": _norm_id(fr.get("ID No.", "")), "name": str(fr.get("Name", "")).strip(),
-               "desig": str(fr.get("Designation", ""))}
-        if rec["fid"]:
-            by_id[rec["fid"]] = rec
-        by_key.setdefault(_exam_key(rec["name"]), rec)
-    return by_id, by_key
-
-def _find_header(raw: pd.DataFrame):
-    """Row index (0-based) whose cells include a Name and a Date heading."""
-    for i in range(min(len(raw), 15)):
-        cells = [str(v).strip().upper() for v in raw.iloc[i].tolist()]
-        if any("NAME" in c for c in cells) and any("DATE" in c for c in cells):
-            return i
-    return None
-
-def parse_final_allotment(f, fac_df):
-    """Read an allotment Excel (the app's own download, the authorities export, or a
-    hand-edited copy). Returns (records, errors)."""
-    xl = pd.ExcelFile(f)
-    order = ([s for s in xl.sheet_names if s.lower() in ("full_allocation", "date-wise")]
-             + [s for s in xl.sheet_names if s.lower() not in ("full_allocation", "date-wise")])
-    df = None
-    for sh in order:
-        raw = pd.read_excel(xl, sheet_name=sh, header=None, dtype=object)
-        h = _find_header(raw)
-        if h is None:
-            continue
-        cand = pd.read_excel(xl, sheet_name=sh, header=h, dtype=object)
-        cand.columns = [str(c).strip() for c in cand.columns]
-        if any("SESS" in c.upper() for c in cand.columns):
-            df = cand
-            break
-    if df is None:
-        return [], ["No sheet with Name, Date and Session columns was found."]
-    up = {c: c.upper() for c in df.columns}
-    c_name = next((c for c in df.columns if "NAME" in up[c]), None)
-    c_id   = next((c for c in df.columns if ("ID" in up[c] and "MAIL" not in up[c]) or "CODE" in up[c]), None)
-    c_date = next((c for c in df.columns if "DATE" in up[c]), None)
-    c_sess = next((c for c in df.columns if "SESS" in up[c]), None)
-    c_type = next((c for c in df.columns if up[c] in ("TYPE", "MODE", "DUTY TYPE")), None)
-    by_id, by_key = _people_index(fac_df)
-    recs, errs = [], []
-    for i, r in df.iterrows():
-        nm = str(r.get(c_name, "") if c_name else "").strip()
-        fid = _norm_id(r.get(c_id, "")) if c_id else ""
-        if (not nm or nm.lower() == "nan") and (not fid or fid == "NAN"):
-            continue                                            # blank row
-        d = parse_date_safe(r.get(c_date))
-        sn = normalize_session(r.get(c_sess, ""))
-        if pd.isna(d) or sn not in ("FN", "AN"):
-            errs.append(f"Row {i + 2}: {nm or fid} — date or session not readable "
-                        f"('{r.get(c_date)}', '{r.get(c_sess)}').")
-            continue
-        p = by_id.get(fid) if fid and fid != "NAN" else None
-        p = p or by_key.get(_exam_key(nm))
-        if p is None:
-            errs.append(f"Row {i + 2}: '{nm or fid}' not found in the faculty list.")
-            continue
-        recs.append({
-            "faculty_id": p["fid"], "faculty_name": p["name"], "designation": p["desig"],
-            "duty_date": d.date().isoformat(), "session": sn,
-            "duty_type": (str(r.get(c_type)).strip() if c_type and str(r.get(c_type)).strip().lower()
-                          not in ("", "nan") else "Offline"),
-            "allocated_by": "Final (admin upload)",
-        })
-    return recs, errs
-
-def check_allotment(recs, fac_df, offline_df) -> dict:
-    """Rule check of an allotment. Returns {'errors': [...], 'warnings': [...]}."""
-    errors, warns = [], []
-    people = _swap_people(fac_df)
-    seen, per_day, per_fac, per_slot = set(), {}, {}, {}
-    for r in recs:
-        k = (r["faculty_id"], r["duty_date"], r["session"])
-        if k in seen:
-            errors.append(f"{r['faculty_name']} is listed twice on {_duty_txt(r['duty_date'], r['session'])}.")
-        seen.add(k)
-        per_day.setdefault((r["faculty_id"], r["duty_date"]), []).append(r["session"])
-        per_fac[r["faculty_id"]] = per_fac.get(r["faculty_id"], 0) + 1
-        per_slot[(r["duty_date"], r["session"])] = per_slot.get((r["duty_date"], r["session"]), 0) + 1
-        d = parse_date_safe(r["duty_date"]).date()
-        if not (SEMESTER_CAL_START <= d <= SEMESTER_CAL_END):
-            errors.append(f"{r['faculty_name']}: {d:%d-%m-%Y} is outside the exam period.")
-        p = people.get(r["faculty_id"])
-        if p and d in p["blocked"]:
-            warns.append(f"{r['faculty_name']} has duty on a blocked date "
-                         f"(valuation / exam / lab): {_duty_txt(r['duty_date'], r['session'])}.")
-    for (fid, dd), ss in per_day.items():
-        if len(ss) > 1:
-            warns.append(f"{people.get(fid, {}).get('name', fid)} has both FN and AN on "
-                         f"{parse_date_safe(dd):%d-%m-%Y}.")
-    # session requirement
-    if offline_df is not None and not offline_df.empty:
-        req = (offline_df.assign(_d=offline_df["Date"].dt.date.astype(str),
-                                 _s=offline_df["Session"].astype(str).str.upper())
-               .groupby(["_d", "_s"])["Required"].sum().to_dict())
-        for (dd, ss), n in sorted(req.items()):
-            got = per_slot.get((dd, ss), 0)
-            if got != int(n):
-                warns.append(f"{_duty_txt(dd, ss)}: required {int(n)}, allotted {got}.")
-        for (dd, ss), got in sorted(per_slot.items()):
-            if (dd, ss) not in req:
-                warns.append(f"{_duty_txt(dd, ss)}: {got} allotted, but this session is not in the duty schedule.")
-    # per-faculty count
-    for _, fr in fac_df.iterrows():
-        fid = _norm_id(fr.get("ID No.", "")); nm = str(fr.get("Name", "")).strip()
-        need = fac_duty_range(nm, str(fr.get("Designation", "")))[0]
-        got = per_fac.get(fid, 0)
-        if need and got != need:
-            warns.append(f"{nm} ({fid}): expected {need} duties, allotted {got}.")
-    return {"errors": errors, "warnings": warns}
-
-def build_authority_excel(allocs: list, fac_rows: list, offline_df=None) -> bytes:
-    """Formatted final allotment for the authorities — faculty + research scholars together."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    from openpyxl.utils import get_column_letter
-    F  = "Arial"
-    thin = Side(style="thin", color="999999")
-    box  = Border(left=thin, right=thin, top=thin, bottom=thin)
-    hdr_fill = PatternFill("solid", fgColor="1E3A5F")
-    alt_fill = PatternFill("solid", fgColor="F1F5F9")
-    titles = ["SASTRA Deemed University — School of Mechanical Engineering",
-              f"Invigilation Duty Allotment — {SEMESTER_LABEL}",
-              f"Generated on {datetime.date.today():%d-%m-%Y}"]
-
-    fac = {}
-    for r in fac_rows:
-        code = _map_desig(r.get("designation", ""))
-        fac[_norm_id(r.get("faculty_id", ""))] = {
-            "name": " ".join(str(r.get("name", "")).split()), "code": code,
-            "desig": DESIG_FULL.get(code, code)}
-    duties = {}
-    for a in allocs:
-        fid = _norm_id(a.get("faculty_id", ""))
-        d = parse_date_safe(a.get("duty_date"))
-        if pd.isna(d):
-            continue
-        duties.setdefault(fid, []).append((d.date(), str(a.get("session", "")).upper()))
-        if fid not in fac:
-            code = _map_desig(a.get("designation", ""))
-            fac[fid] = {"name": " ".join(str(a.get("faculty_name", "")).split()), "code": code,
-                        "desig": DESIG_FULL.get(code, code)}
-    order = sorted(fac, key=lambda f: (_DESIG_RANK.get(fac[f]["code"], 99), fac[f]["name"].lower()))
-
-    def _sheet(ws, header, rows, widths):
-        ncol = len(header)
-        for i, t in enumerate(titles, start=1):
-            ws.cell(row=i, column=1, value=t).font = Font(name=F, bold=(i < 3), size=(13 if i == 1 else 11))
-            ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=ncol)
-            ws.cell(row=i, column=1).alignment = Alignment(horizontal="center")
-        hr = len(titles) + 2
-        for j, h in enumerate(header, start=1):
-            c = ws.cell(row=hr, column=j, value=h)
-            c.font = Font(name=F, bold=True, color="FFFFFF"); c.fill = hdr_fill; c.border = box
-            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        for i, row in enumerate(rows):
-            for j, v in enumerate(row, start=1):
-                c = ws.cell(row=hr + 1 + i, column=j, value=v)
-                c.font = Font(name=F); c.border = box
-                c.alignment = Alignment(vertical="center", wrap_text=True)
-                if i % 2:
-                    c.fill = alt_fill
-        for j, w in enumerate(widths, start=1):
-            ws.column_dimensions[get_column_letter(j)].width = w
-        ws.freeze_panes = ws.cell(row=hr + 1, column=1)
-        ws.print_title_rows = f"{hr}:{hr}"
-        ws.page_setup.orientation = "landscape"
-        ws.page_setup.fitToWidth = 1; ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-
-    wb = Workbook()
-    # Sheet 1 — faculty-wise
-    maxd = max([len(v) for v in duties.values()] + [1])
-    ws = wb.active; ws.title = "Faculty-wise"
-    rows = []
-    for n, fid in enumerate(order, start=1):
-        ds = sorted(duties.get(fid, []))
-        rows.append([n, fid, fac[fid]["name"], fac[fid]["desig"], len(ds)]
-                    + [f"{d:%d-%m-%Y} ({d:%a}) {s}" for d, s in ds] + [""] * (maxd - len(ds)))
-    _sheet(ws, ["Sl.No", "ID No.", "Name", "Designation", "No. of Duties"]
-               + [f"Duty {i}" for i in range(1, maxd + 1)],
-           rows, [7, 10, 32, 24, 10] + [22] * maxd)
-    # Sheet 2 — date-wise
-    ws2 = wb.create_sheet("Date-wise")
-    flat = sorted([(d, 0 if s == "FN" else 1, s, fid) for fid, v in duties.items() for d, s in v],
-                  key=lambda x: (x[0], x[1], _DESIG_RANK.get(fac[x[3]]["code"], 99), fac[x[3]]["name"].lower()))
-    _sheet(ws2, ["Sl.No", "Date", "Day", "Session", "ID No.", "Name", "Designation"],
-           [[i, f"{d:%d-%m-%Y}", f"{d:%A}", s, fid, fac[fid]["name"], fac[fid]["desig"]]
-            for i, (d, _o, s, fid) in enumerate(flat, start=1)],
-           [7, 12, 12, 9, 10, 32, 24])
-    # Sheet 3 — session summary
-    ws3 = wb.create_sheet("Session Summary")
-    cnt = {}
-    for d, _o, s, _f in flat:
-        cnt[(d, s)] = cnt.get((d, s), 0) + 1
-    req = {}
-    if offline_df is not None and not offline_df.empty:
-        for _, r in offline_df.iterrows():
-            req[(r["Date"].date(), str(r["Session"]).upper())] = \
-                req.get((r["Date"].date(), str(r["Session"]).upper()), 0) + int(r["Required"])
-    keys = sorted(set(cnt) | set(req), key=lambda k: (k[0], 0 if k[1] == "FN" else 1))
-    _sheet(ws3, ["Sl.No", "Date", "Day", "Session", "Required", "Allotted", "Status"],
-           [[i, f"{d:%d-%m-%Y}", f"{d:%A}", s, req.get((d, s), ""), cnt.get((d, s), 0),
-             ("OK" if req.get((d, s)) == cnt.get((d, s), 0) else "Check") if req else ""]
-            for i, (d, s) in enumerate(keys, start=1)]
-           + [["", "", "", "Total", sum(req.values()) if req else "", sum(cnt.values()), ""]],
-           [7, 12, 12, 9, 10, 10, 9])
-    bio = io.BytesIO(); wb.save(bio)
-    return bio.getvalue()
-
+def db_get_all_allocation():
+    r = _sb().table("final_allocation").select("*").order("duty_date").execute()
+    return r.data or []
 
 def db_get_setting(key: str, default: str = "") -> str:
     # Try session state cache first (avoids a DB round-trip and works even if table missing)
@@ -1443,13 +1038,11 @@ def get_all_willingness():
     return load_willingness()
 
 def save_submission(faculty_name, slots):
-    if st.session_state.get("_preview_fid"):
-        return   # admin preview never writes
     fid = st.session_state.get("_logged_fid", faculty_name)
     db_submit_willingness(fid, faculty_name, slots)
 
 def already_submitted(faculty_name: str) -> bool:
-    fid = st.session_state.get("_preview_fid") or st.session_state.get("_logged_fid", "")
+    fid = st.session_state.get("_logged_fid", "")
     if fid:
         return db_already_submitted(fid)
     wl = load_willingness()
@@ -2883,81 +2476,16 @@ def page_admin(fac_df, offline_df, online_df):
         '<p class="card-sub">Full administrative access.</p></div>',
         unsafe_allow_html=True)
 
-    t1, t2, t3, t7, t6, t4, t5 = st.tabs([
+    t1, t2, t3, t4, t5 = st.tabs([
         "📋 Willingness Records",
         "🤖 Run Optimizer",
         "📊 View Results",
-        "📌 Final Allotment & Publish",
-        "🔄 Duty Swaps",
         "👥 Faculty Accounts",
         "⚙️ Portal Settings",
     ])
-    with t7:
-        admin_final_allotment(fac_df, offline_df)
-    with t6:
-        admin_swap_panel(fac_df)
 
     # ── Tab 1: Willingness Records ──────────────────────────────── #
     with t1:
-        # ── Willingness submission status (who has / has not submitted) ──
-        st.markdown("### 📌 Willingness Submission Status")
-        _fac_rows = db_get_all_faculty()
-        _w_rows   = db_get_all_willingness_rows()
-        _wcnt = {}
-        for _r in _w_rows:
-            _k = _norm_id(_r.get("faculty_id", ""))
-            _wcnt[_k] = _wcnt.get(_k, 0) + 1
-        _stat = []
-        for _r in _fac_rows:
-            _nm   = str(_r.get("name", "")).strip()
-            _code = _map_desig(_r.get("designation", ""))
-            _need = FACULTY_WILL_OVERRIDE.get(_norm_name(_nm), DUTY_STRUCTURE.get(_code, 0))
-            _got  = _wcnt.get(_norm_id(_r.get("faculty_id", "")), 0)
-            _stat.append({
-                "ID No.": _r.get("faculty_id", ""), "Name": _nm,
-                "Designation": DESIG_FULL.get(_code, _code),
-                "Duties": fac_duty_range(_nm, _code)[0],
-                "Options Required": _need, "Options Submitted": _got,
-                "Status": ("❌ Not Submitted" if _got == 0 else
-                           "⚠ Incomplete" if _got < _need else "✅ Submitted"),
-            })
-        _sdf = pd.DataFrame(_stat)
-        if _sdf.empty:
-            st.info("No faculty found.")
-        else:
-            _order = {"❌ Not Submitted": 0, "⚠ Incomplete": 1, "✅ Submitted": 2}
-            _rank = {DESIG_FULL.get(c, c): i for i, c in
-                     enumerate(["P", "ACP", "SAP", "AP3", "AP2", "TA", "RA"])}
-            _sdf = (_sdf.assign(_o=_sdf["Status"].map(_order),
-                                _r=_sdf["Designation"].map(_rank).fillna(99))
-                        .sort_values(["_o", "_r", "Name"]).drop(columns=["_o", "_r"])
-                        .reset_index(drop=True))
-            _m1, _m2, _m3, _m4 = st.columns(4)
-            _m1.metric("Total", len(_sdf))
-            _m2.metric("✅ Submitted", int((_sdf["Status"] == "✅ Submitted").sum()))
-            _m3.metric("⚠ Incomplete", int((_sdf["Status"] == "⚠ Incomplete").sum()))
-            _m4.metric("❌ Not Submitted", int((_sdf["Status"] == "❌ Not Submitted").sum()))
-            _show = st.radio("Show", ["Not Submitted", "Incomplete", "Submitted", "All"],
-                             horizontal=True, key="will_status_filter")
-            _view = _sdf if _show == "All" else _sdf[_sdf["Status"].str.contains(_show)]
-            _view = _view.reset_index(drop=True)
-            _view.insert(0, "Sl.No", _view.index + 1)
-            st.dataframe(_view, use_container_width=True, hide_index=True)
-            _xb = io.BytesIO()
-            with pd.ExcelWriter(_xb, engine="openpyxl") as _xw:
-                for _sh, _flt in [("Not Submitted", "Not Submitted"), ("Incomplete", "Incomplete"),
-                                  ("Submitted", "✅ Submitted"), ("All", None)]:
-                    _d = _sdf if _flt is None else _sdf[_sdf["Status"].str.contains(_flt)]
-                    _d = _d.reset_index(drop=True)
-                    _d.insert(0, "Sl.No", _d.index + 1)
-                    _d.to_excel(_xw, sheet_name=_sh, index=False)
-            st.download_button(
-                "⬇ Download Status (Excel)", data=_xb.getvalue(),
-                file_name=f"Willingness_Status_{datetime.date.today():%d-%m-%Y}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="dl_will_status")
-        st.markdown("---")
-
         st.markdown("### 📋 Willingness Records")
         st.caption("All willingness submitted by faculty via this portal.")
 
@@ -3506,19 +3034,16 @@ def page_admin(fac_df, offline_df, online_df):
                 "<span style='font-size:1.05rem;font-weight:700;color:#991b1b'>"
                 "🔴  Allotment view is DISABLED — faculty see a waiting message.</span>"
                 "</div>", unsafe_allow_html=True)
-        _has_alloc = bool(db_get_all_allocation())
-        if not _has_alloc:
-            st.info("Upload the final allotment first in the **📌 Final Allotment & Publish** tab.")
         en_col, dis_col = st.columns(2)
         with en_col:
             if st.button("✅ Enable Allotment View", use_container_width=True,
-                         disabled=is_open or not _has_alloc, type="primary"):
+                         disabled=is_open, type="primary"):
                 set_gate(True); st.success("Enabled."); st.rerun()
         with dis_col:
             if st.button("🔴 Disable Allotment View", use_container_width=True,
                          disabled=not is_open):
                 set_gate(False); st.warning("Disabled."); st.rerun()
-        st.caption("Workflow: Upload final allotment → Publish (here or in 📌 Final Allotment & Publish).")
+        st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
 
         st.markdown("---")
         st.markdown("#### 📅 Upload Duty Slots (Exam Schedule)")
@@ -3590,283 +3115,6 @@ def page_admin(fac_df, offline_df, online_df):
 # ═══════════════════════════════════════════════════════════════ #
 #             ALLOTMENT VIEW (faculty self-service)              #
 # ═══════════════════════════════════════════════════════════════ #
-def admin_final_allotment(fac_df, offline_df):
-    st.markdown("### 📌 Final Allotment & Publish")
-    _live = db_get_all_allocation()
-    _open = gate_is_open() and bool(_live)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Duties in final allotment", len(_live))
-    c2.metric("Faculty / scholars with duty", len({_norm_id(a.get('faculty_id')) for a in _live}))
-    c3.metric("Visible to faculty", "🟢 Yes" if _open else "🔴 No")
-
-    # ── STEP 1 — Upload ────────────────────────────────────────
-    st.markdown("#### Step 1 — Upload the final allotment Excel")
-    st.caption("Use your manually corrected allotment. The Excel needs **Name** (or **ID No.**), "
-               "**Date** and **Session** columns — e.g. the allotment downloaded from this app, "
-               "after your edits. Uploading REPLACES the current final allotment.")
-    _f = st.file_uploader("Final allotment (.xlsx)", type=["xlsx", "xls"], key="fa_upload")
-    if _f:
-        try:
-            _recs, _errs = parse_final_allotment(_f, fac_df)
-        except Exception as _e:
-            _recs, _errs = [], [f"Could not read the file: {_e}"]
-        _chk = check_allotment(_recs, fac_df, offline_df) if _recs else {"errors": [], "warnings": []}
-        _errs = _errs + _chk["errors"]
-        st.info(f"**{len(_recs)}** duties read for "
-                f"**{len({r['faculty_id'] for r in _recs})}** faculty / scholars.")
-        if _errs:
-            st.error(f"❌ {len(_errs)} problem(s) — fix these in the Excel and upload again:")
-            st.markdown("\n".join(f"- {e}" for e in _errs[:40]))
-        if _chk["warnings"]:
-            with st.expander(f"⚠ {len(_chk['warnings'])} item(s) to review "
-                             "(allowed, since you changed them manually)"):
-                st.markdown("\n".join(f"- {w}" for w in _chk["warnings"]))
-        elif _recs and not _errs:
-            st.success("✔ Every session matches the duty schedule and every person has "
-                       "their expected number of duties.")
-        if _recs and not _errs:
-            _ok = st.checkbox("I confirm this is the final allotment", key="fa_confirm")
-            if st.button("✅ Save as Final Allotment", type="primary", disabled=not _ok,
-                         use_container_width=True, key="fa_apply"):
-                try:
-                    db_save_allocation(_recs)
-                    _n = len(db_get_all_allocation())
-                    try:
-                        for _sw in db_swaps_all():
-                            if _sw.get("status") in SWAP_OPEN_STATUSES:
-                                db_swap_update(_sw["id"], {"status": "superseded",
-                                    "admin_note": "Closed: final allotment re-uploaded"})
-                    except Exception:
-                        pass
-                    if _n == len(_recs):
-                        st.success(f"✅ Final allotment saved ({_n} duties). Now go to Step 2.")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ Only {_n} of {len(_recs)} duties were saved — check "
-                                 "Row Level Security on final_allocation.")
-                except Exception as _e:
-                    st.error(f"❌ Save failed: {_e}")
-
-    # ── STEP 2 — Publish ───────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Step 2 — Publish to faculty & research scholars")
-    if not _live:
-        st.info("🔒 Upload and save the final allotment in Step 1 first. Publishing is locked "
-                "until then.")
-    else:
-        st.caption("Once published, everyone sees their duties under **My Allotment** and can "
-                   "submit duty swaps for your approval.")
-        g1, g2 = st.columns(2)
-        if g1.button("🟢 Publish allotment to faculty", type="primary", use_container_width=True,
-                     disabled=_open, key="fa_pub"):
-            set_gate(True); st.rerun()
-        if g2.button("🔴 Hide allotment from faculty", use_container_width=True,
-                     disabled=not _open, key="fa_hide"):
-            set_gate(False); st.rerun()
-
-    # ── STEP 3 — Download ──────────────────────────────────────
-    st.markdown("---")
-    st.markdown("#### Step 3 — Download for authorities")
-    if not _live:
-        st.caption("Available after the final allotment is saved.")
-    else:
-        st.download_button(
-            "⬇ Download Final Allotment for Authorities (Excel)",
-            data=build_authority_excel(_live, db_get_all_faculty(), offline_df),
-            file_name=f"Final_Invigilation_Allotment_{datetime.date.today():%d-%m-%Y}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key="dl_authority")
-        st.caption("Faculty and research scholars together · sheets: Faculty-wise, Date-wise, "
-                   "Session Summary · always includes every approved swap — download again "
-                   "after approving swaps.")
-
-
-def section_swap(fac_df, my_fid: str, preview: bool = False):
-    """Faculty side of duty swap — shown on My Allotment once allotment is published."""
-    st.markdown("---")
-    st.markdown("### 🔄 Duty Swap — Mutual Adjustment")
-    st.caption("Exchange one of your duties with a colleague after discussing it with them. "
-               "Either of you can submit the swap; it goes directly to the Examination "
-               "Committee for approval. Both of you keep the same number of duties.")
-    try:
-        swaps = db_swaps_all()
-    except Exception:
-        st.info("Duty swap is not enabled yet. Please contact the Examination Committee.")
-        return
-    me     = _norm_id(my_fid)
-    allocs = db_get_all_allocation()
-    people = _swap_people(fac_df)
-    if me not in people:
-        st.info("Your record was not found for swapping. Contact admin.")
-        return
-    by_id  = {str(a.get("id")): a for a in allocs}
-
-    # ── 2. My swap history ──────────────────────────────────────
-    mine = [s for s in swaps if me in (_norm_id(s.get("requester_id")), _norm_id(s.get("partner_id")))]
-    if mine:
-        st.markdown("#### 📄 Swap requests involving you")
-        rows = []
-        for s in mine:
-            i_req = _norm_id(s.get("requester_id")) == me
-            rows.append({
-                "Swap #": s["id"],
-                "With": s["partner_name"] if i_req else s["requester_name"],
-                "You give": _duty_txt(s["req_date"], s["req_session"]) if i_req
-                            else _duty_txt(s["partner_date"], s["partner_session"]),
-                "You take": _duty_txt(s["partner_date"], s["partner_session"]) if i_req
-                            else _duty_txt(s["req_date"], s["req_session"]),
-                "Status": SWAP_STATUS_LABEL.get(s.get("status"), s.get("status")),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        cancellable = [s for s in mine if _norm_id(s.get("requester_id")) == me
-                       and s.get("status") in SWAP_OPEN_STATUSES]
-        if cancellable:
-            cx = st.selectbox("Cancel a request", [s["id"] for s in cancellable],
-                              format_func=lambda i: f"Swap #{i}", key="sw_cancel_pick")
-            if st.button("↩ Cancel this request", key="sw_cancel_btn", disabled=preview):
-                db_swap_update(cx, {"status": "cancelled"})
-                st.rerun()
-
-    # ── 3. Find an easy match ───────────────────────────────────
-    st.markdown("#### 🔍 Find swap partners")
-    today = datetime.date.today()
-    lock  = _locked_alloc_ids(swaps)
-    my_duties = sorted([a for a in allocs if _norm_id(a.get("faculty_id")) == me
-                        and _alloc_date(a) and _alloc_date(a) > today
-                        and str(a.get("id")) not in lock],
-                       key=lambda a: (_alloc_date(a), str(a.get("session"))))
-    if not my_duties:
-        st.caption("No upcoming duty available to swap (past duties and duties already in a "
-                   "pending swap are not listed).")
-        return
-    pick = st.selectbox("Your duty to swap", [str(a["id"]) for a in my_duties],
-                        format_func=lambda i: _duty_txt(by_id[i]["duty_date"], by_id[i]["session"]),
-                        key="sw_my_duty")
-    my_alloc = by_id[pick]
-    cands = swap_candidates(me, my_alloc, allocs, people, swaps, _will_by_fid())
-    if not cands:
-        st.warning("No colleague can swap this duty without breaking a rule "
-                   "(valuation / exam / lab dates, or one duty per day).")
-        return
-    n_p = sum(c["level"] == "perfect" for c in cands)
-    n_g = sum(c["level"] == "good" for c in cands)
-    st.caption(f"{len(cands)} possible partner(s): 🟢 {n_p} perfect · 🟡 {n_g} good · "
-               f"⚪ {len(cands) - n_p - n_g} possible. "
-               "🟢 = both of you had chosen each other's slot in willingness; "
-               "🟡 = one of you had.")
-    lv = st.radio("Show", ["🟢 + 🟡 best matches", "All"], horizontal=True, key="sw_lv")
-    show = [c for c in cands if lv == "All" or c["level"] != "possible"] or cands
-    st.dataframe(pd.DataFrame([{
-        "Match": SWAP_LEVEL_LABEL[c["level"]], "Colleague": c["partner_name"],
-        "Designation": DESIG_FULL.get(c["partner_desig"], c["partner_desig"]),
-        "You would take": _duty_txt(c["date"], c["session"]),
-        "They would take": _duty_txt(my_alloc["duty_date"], my_alloc["session"]),
-    } for c in show]), use_container_width=True, hide_index=True)
-
-    ci = st.selectbox("Send request to", range(len(show)),
-                      format_func=lambda i: f"{SWAP_LEVEL_LABEL[show[i]['level']][:1]} "
-                                            f"{show[i]['partner_name']} — take "
-                                            f"{_duty_txt(show[i]['date'], show[i]['session'])}",
-                      key="sw_cand_pick")
-    st.caption("💡 Submit only after you and your colleague have agreed. The request goes "
-               "straight to the Examination Committee; your colleague can see it on their page.")
-    if st.button("📨 Submit Swap for Approval", type="primary", use_container_width=True,
-                 key="sw_send", disabled=preview):
-        c = show[ci]
-        db_swap_create({
-            "requester_id": me, "requester_name": people[me]["name"],
-            "req_alloc_id": str(my_alloc["id"]), "req_date": str(_alloc_date(my_alloc)),
-            "req_session": str(my_alloc["session"]).upper(),
-            "partner_id": c["partner_id"], "partner_name": c["partner_name"],
-            "partner_alloc_id": str(c["alloc"]["id"]), "partner_date": str(c["date"]),
-            "partner_session": c["session"], "match_level": c["level"],
-            "status": "pending_admin",
-        })
-        st.success(f"Swap with {c['partner_name']} submitted to the Examination Committee for approval.")
-        st.rerun()
-
-
-def admin_swap_panel(fac_df):
-    st.markdown("### 🔄 Duty Swap Requests")
-    try:
-        swaps = db_swaps_all()
-    except Exception:
-        st.warning("The `duty_swaps` table does not exist yet. Run this once in Supabase → SQL Editor, "
-                   "then reload:")
-        st.code(SWAP_TABLE_SQL, language="sql")
-        return
-    pend = [s for s in swaps if s.get("status") == "pending_admin"]
-    st.markdown(f"#### 🕒 Waiting for your approval ({len(pend)})")
-    if not pend:
-        st.caption("No swaps waiting for approval.")
-    allocs = db_get_all_allocation() if pend else []
-    people = _swap_people(fac_df) if pend else {}
-    for sw in pend:
-        err = validate_swap(sw, allocs, people)
-        st.markdown(
-            "<div style='background:#f8fafc;border:2px solid #94a3b8;border-radius:10px;"
-            "padding:10px 14px;margin:6px 0'>"
-            f"<b>Swap #{sw['id']}</b> &nbsp; {SWAP_LEVEL_LABEL.get(sw.get('match_level'), '')}<br>"
-            f"<b>{sw['requester_name']}</b> ({sw['requester_id']}) → takes "
-            f"<b>{_duty_txt(sw['partner_date'], sw['partner_session'])}</b><br>"
-            f"<b>{sw['partner_name']}</b> ({sw['partner_id']}) → takes "
-            f"<b>{_duty_txt(sw['req_date'], sw['req_session'])}</b><br>"
-            + (f"<span style='color:#b91c1c'>⚠ {err}</span>" if err
-               else "<span style='color:#15803d'>✔ Still valid — all rules checked</span>")
-            + "</div>", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns([1, 1, 2])
-        note = c3.text_input("Note (optional)", key=f"sw_note_{sw['id']}",
-                             label_visibility="collapsed", placeholder="Note (optional)")
-        if c1.button("✅ Approve", key=f"sw_ap_{sw['id']}", type="primary",
-                     use_container_width=True, disabled=bool(err)):
-            e2 = apply_swap(sw, fac_df)
-            if e2:
-                st.error(e2)
-            else:
-                if note:
-                    db_swap_update(sw["id"], {"admin_note": note})
-                st.success(f"Swap #{sw['id']} approved — both allotments updated.")
-                st.rerun()
-        if c2.button("⛔ Reject", key=f"sw_rj_{sw['id']}", use_container_width=True):
-            db_swap_update(sw["id"], {"status": "rejected", "admin_decided_at": _now_iso(),
-                                      "admin_note": note or err or ""})
-            st.rerun()
-
-    st.markdown("---")
-    st.markdown("#### 📜 Swap Log")
-    if not swaps:
-        st.caption("No swap requests yet.")
-    else:
-        log = pd.DataFrame([{
-            "Swap #": s["id"],
-            "Requested on": str(s.get("created_at", ""))[:16].replace("T", " "),
-            "Requester": f"{s['requester_name']} ({s['requester_id']})",
-            "Requester gives": _duty_txt(s["req_date"], s["req_session"]),
-            "Partner": f"{s['partner_name']} ({s['partner_id']})",
-            "Partner gives": _duty_txt(s["partner_date"], s["partner_session"]),
-            "Match": SWAP_LEVEL_LABEL.get(s.get("match_level"), ""),
-            "Status": SWAP_STATUS_LABEL.get(s.get("status"), s.get("status")),
-            "Note": s.get("admin_note") or "",
-        } for s in swaps])
-        st.dataframe(log, use_container_width=True, hide_index=True)
-        _xb = io.BytesIO()
-        with pd.ExcelWriter(_xb, engine="openpyxl") as _xw:
-            log.to_excel(_xw, sheet_name="Swap Log", index=False)
-            _al = pd.DataFrame(db_get_all_allocation())
-            if not _al.empty:
-                _al["Date"] = _al["duty_date"].apply(lambda d: _duty_txt(d, "")[:-1])
-                _al = _al.rename(columns={"faculty_id": "ID No.", "faculty_name": "Name",
-                                          "designation": "Designation", "session": "Session",
-                                          "allocated_by": "Allocated By"})
-                _cols = [c for c in ["ID No.", "Name", "Designation", "Date", "Session",
-                                     "Allocated By"] if c in _al.columns]
-                _al[_cols].to_excel(_xw, sheet_name="Current Allotment", index=False)
-        st.download_button("⬇ Download Swap Log (Excel)", data=_xb.getvalue(),
-                           file_name=f"Swap_Log_{datetime.date.today():%d-%m-%Y}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           key="dl_swap_log")
-
-
 def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
     st.markdown("### My Allotment Details")
 
@@ -3881,7 +3129,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
             f" → <b>{_ae.strftime('%d-%m-%Y')} ({_ae.strftime('%A')})</b>"
             f"</div>", unsafe_allow_html=True)
 
-    if not gate_is_open() or not db_get_all_allocation():
+    if not gate_is_open():
         st.markdown(
             "<div style='background:#fef3c7;border:2px solid #f59e0b;border-radius:12px;"
             "padding:22px 26px;text-align:center;margin:18px 0'>"
@@ -3909,8 +3157,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
                     wdisp.append(f"{fmt_day(d2)} - {str(s2).upper()}")
                     will_pairs.add((nd.date(), str(s2).upper()))
 
-    _logged_fid_allot = (st.session_state.get("_preview_fid")
-                         or st.session_state.get("_logged_fid", ""))
+    _logged_fid_allot = st.session_state.get("_logged_fid", "")
     _allot_db_rows    = db_get_allocation_for(_logged_fid_allot) if _logged_fid_allot else []
     idisp = []
     allot_pairs: set = set()
@@ -3959,10 +3206,6 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
         f"border:1.5px solid #86efac;border-radius:10px;font-size:.9rem;color:#166534'>"
         f"📊 <b>Willingness Accommodation:</b> {acc_pct}</div>",
         unsafe_allow_html=True)
-
-    if _allot_db_rows:
-        section_swap(fac_df, _logged_fid_allot,
-                     preview=bool(st.session_state.get("_preview_fid")))
 
     st.markdown(
         "<div style='margin-top:10px;padding:10px 14px;background:#f1f5f9;"
@@ -4037,8 +3280,7 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         st.session_state.selected_slots   = []
         st.session_state["picked_date"]   = valid_d[0] if valid_d else None
 
-    if st.session_state.get("picked_date") not in valid_d:
-        # stale value (e.g. page opened before slots were loaded) → reset
+    if "picked_date" not in st.session_state:
         st.session_state["picked_date"] = valid_d[0] if valid_d else None
 
     # Show exam period banner
@@ -4273,11 +3515,8 @@ def page_willingness(fac_df, offline_df, online_df, sel_name, frow):
         elif not is_already:
             st.info(f"Select {rem2} more option(s) to enable submission.")
 
-        _preview = bool(st.session_state.get("_preview_fid"))
-        if _preview:
-            st.info("👁 Admin preview — submission is disabled here.")
         if st.button("✅ Submit Willingness",
-                     disabled=(_preview or len(st.session_state.selected_slots) != req_cnt),
+                     disabled=(len(st.session_state.selected_slots) != req_cnt),
                      use_container_width=True):
             save_submission(sel_name, st.session_state.selected_slots)
             st.session_state.selected_slots = []
@@ -4367,42 +3606,8 @@ def main():
 
     # ── 6. Main panel routing ─────────────────────────────────────
     if is_admin:
-        menu = st.radio("Main Menu", ["User View", "Admin View", "👁 View as Faculty"],
+        menu = st.radio("Main Menu", ["User View", "Admin View"],
                         horizontal=True, key="panel_mode")
-        st.session_state["_preview_fid"] = ""
-        if menu == "👁 View as Faculty":
-            _all = db_get_all_faculty()
-            _opts = {f'{r["name"]} ({r["faculty_id"]})': r for r in
-                     sorted(_all, key=lambda r: str(r.get("name", "")).lower())}
-            _pick = st.selectbox("Select faculty to see exactly what they see", list(_opts),
-                                 key="preview_fac_pick")
-            _r = _opts[_pick]
-            _pname  = str(_r["name"]).strip()
-            _pmatch = fac_df[fac_df["Clean"] == clean(_pname)]
-            st.markdown(
-                "<div style='background:#fef9c3;border:2px solid #eab308;border-radius:10px;"
-                "padding:8px 14px;margin:6px 0 10px 0;font-weight:700;color:#713f12'>"
-                f"👁 Admin preview — viewing the portal as <u>{_pname}</u> "
-                f"({_r['faculty_id']}). Nothing can be submitted from here.</div>",
-                unsafe_allow_html=True)
-            if _pmatch.empty:
-                st.error("This faculty's record was not found in the loaded faculty list — "
-                         "this is exactly the error they would see. Click 'Clear All Cached Data' "
-                         "in Admin View and check their name/designation in Supabase.")
-            else:
-                st.session_state["_preview_fid"] = _norm_id(_r["faculty_id"])
-                _prow = _pmatch.iloc[0]
-                st.caption(f"Designation in portal: **{_prow['Designation']}** · "
-                           f"Raw in Supabase: **{_r.get('designation', '')}**")
-                _ptab = st.radio("Their view", ["Willingness", "My Allotment"],
-                                 horizontal=True, key="preview_tab")
-                if _ptab == "Willingness":
-                    page_willingness(fac_df, offline_df, online_df, _pname, _prow)
-                else:
-                    page_allotment(fac_df, _pname, clean(_pname), _prow, offline_df, online_df)
-            st.markdown("---")
-            st.caption("Curated by Dr. N. Sathiya Narayanan | School of Mechanical Engineering")
-            return
         if menu == "Admin View":
             page_admin(fac_df, offline_df, online_df)
             st.markdown("---")
