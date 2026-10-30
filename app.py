@@ -426,12 +426,14 @@ def db_save_allocation(records: list):
     if records: _sb().table("final_allocation").insert(records).execute()
 
 def db_get_allocation_for(fid: str):
+    """Current-semester allotment only (old May/Jun rows are ignored)."""
     r = _sb().table("final_allocation").select("*").eq("faculty_id", fid).order("duty_date").execute()
-    return r.data or []
+    return [x for x in (r.data or []) if _in_semester_window(x.get("duty_date"))]
 
 def db_get_all_allocation():
+    """Current-semester allotment only (old May/Jun rows are ignored)."""
     r = _sb().table("final_allocation").select("*").order("duty_date").execute()
-    return r.data or []
+    return [x for x in (r.data or []) if _in_semester_window(x.get("duty_date"))]
 
 # ═══════════════════════════════════════════════════════════════ #
 #        DUTY SWAP — MUTUAL ADJUSTMENT (admin-approved)           #
@@ -2881,14 +2883,17 @@ def page_admin(fac_df, offline_df, online_df):
         '<p class="card-sub">Full administrative access.</p></div>',
         unsafe_allow_html=True)
 
-    t1, t2, t3, t4, t5, t6 = st.tabs([
+    t1, t2, t3, t7, t6, t4, t5 = st.tabs([
         "📋 Willingness Records",
         "🤖 Run Optimizer",
         "📊 View Results",
+        "📌 Final Allotment & Publish",
+        "🔄 Duty Swaps",
         "👥 Faculty Accounts",
         "⚙️ Portal Settings",
-        "🔄 Duty Swaps",
     ])
+    with t7:
+        admin_final_allotment(fac_df, offline_df)
     with t6:
         admin_swap_panel(fac_df)
 
@@ -3155,8 +3160,6 @@ def page_admin(fac_df, offline_df, online_df):
 
     # ── Tab 3: View Results ─────────────────────────────────────── #
     with t3:
-        admin_final_allotment(fac_df, offline_df)
-        st.markdown("---")
         st.markdown("### 📊 Allocation Results")
 
         pct_m   = st.session_state.get("pct_milp",    None)
@@ -3503,16 +3506,19 @@ def page_admin(fac_df, offline_df, online_df):
                 "<span style='font-size:1.05rem;font-weight:700;color:#991b1b'>"
                 "🔴  Allotment view is DISABLED — faculty see a waiting message.</span>"
                 "</div>", unsafe_allow_html=True)
+        _has_alloc = bool(db_get_all_allocation())
+        if not _has_alloc:
+            st.info("Upload the final allotment first in the **📌 Final Allotment & Publish** tab.")
         en_col, dis_col = st.columns(2)
         with en_col:
             if st.button("✅ Enable Allotment View", use_container_width=True,
-                         disabled=is_open, type="primary"):
+                         disabled=is_open or not _has_alloc, type="primary"):
                 set_gate(True); st.success("Enabled."); st.rerun()
         with dis_col:
             if st.button("🔴 Disable Allotment View", use_container_width=True,
                          disabled=not is_open):
                 set_gate(False); st.warning("Disabled."); st.rerun()
-        st.caption("Workflow: Disable → Run Optimizer → Review → Enable.")
+        st.caption("Workflow: Upload final allotment → Publish (here or in 📌 Final Allotment & Publish).")
 
         st.markdown("---")
         st.markdown("#### 📅 Upload Duty Slots (Exam Schedule)")
@@ -3585,79 +3591,94 @@ def page_admin(fac_df, offline_df, online_df):
 #             ALLOTMENT VIEW (faculty self-service)              #
 # ═══════════════════════════════════════════════════════════════ #
 def admin_final_allotment(fac_df, offline_df):
-    st.markdown("### 📌 Final Allotment (what faculty see)")
+    st.markdown("### 📌 Final Allotment & Publish")
     _live = db_get_all_allocation()
-    _open = gate_is_open()
+    _open = gate_is_open() and bool(_live)
     c1, c2, c3 = st.columns(3)
     c1.metric("Duties in final allotment", len(_live))
     c2.metric("Faculty / scholars with duty", len({_norm_id(a.get('faculty_id')) for a in _live}))
-    c3.metric("Visible to faculty", "Yes" if _open else "No")
-    g1, g2 = st.columns(2)
-    if g1.button("👁 Publish to faculty", use_container_width=True, disabled=_open or not _live,
-                 key="fa_pub"):
-        set_gate(True); st.rerun()
-    if g2.button("🙈 Hide from faculty", use_container_width=True, disabled=not _open, key="fa_hide"):
-        set_gate(False); st.rerun()
+    c3.metric("Visible to faculty", "🟢 Yes" if _open else "🔴 No")
 
-    # ── Download for authorities ───────────────────────────────
-    if _live:
+    # ── STEP 1 — Upload ────────────────────────────────────────
+    st.markdown("#### Step 1 — Upload the final allotment Excel")
+    st.caption("Use your manually corrected allotment. The Excel needs **Name** (or **ID No.**), "
+               "**Date** and **Session** columns — e.g. the allotment downloaded from this app, "
+               "after your edits. Uploading REPLACES the current final allotment.")
+    _f = st.file_uploader("Final allotment (.xlsx)", type=["xlsx", "xls"], key="fa_upload")
+    if _f:
+        try:
+            _recs, _errs = parse_final_allotment(_f, fac_df)
+        except Exception as _e:
+            _recs, _errs = [], [f"Could not read the file: {_e}"]
+        _chk = check_allotment(_recs, fac_df, offline_df) if _recs else {"errors": [], "warnings": []}
+        _errs = _errs + _chk["errors"]
+        st.info(f"**{len(_recs)}** duties read for "
+                f"**{len({r['faculty_id'] for r in _recs})}** faculty / scholars.")
+        if _errs:
+            st.error(f"❌ {len(_errs)} problem(s) — fix these in the Excel and upload again:")
+            st.markdown("\n".join(f"- {e}" for e in _errs[:40]))
+        if _chk["warnings"]:
+            with st.expander(f"⚠ {len(_chk['warnings'])} item(s) to review "
+                             "(allowed, since you changed them manually)"):
+                st.markdown("\n".join(f"- {w}" for w in _chk["warnings"]))
+        elif _recs and not _errs:
+            st.success("✔ Every session matches the duty schedule and every person has "
+                       "their expected number of duties.")
+        if _recs and not _errs:
+            _ok = st.checkbox("I confirm this is the final allotment", key="fa_confirm")
+            if st.button("✅ Save as Final Allotment", type="primary", disabled=not _ok,
+                         use_container_width=True, key="fa_apply"):
+                try:
+                    db_save_allocation(_recs)
+                    _n = len(db_get_all_allocation())
+                    try:
+                        for _sw in db_swaps_all():
+                            if _sw.get("status") in SWAP_OPEN_STATUSES:
+                                db_swap_update(_sw["id"], {"status": "superseded",
+                                    "admin_note": "Closed: final allotment re-uploaded"})
+                    except Exception:
+                        pass
+                    if _n == len(_recs):
+                        st.success(f"✅ Final allotment saved ({_n} duties). Now go to Step 2.")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Only {_n} of {len(_recs)} duties were saved — check "
+                                 "Row Level Security on final_allocation.")
+                except Exception as _e:
+                    st.error(f"❌ Save failed: {_e}")
+
+    # ── STEP 2 — Publish ───────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Step 2 — Publish to faculty & research scholars")
+    if not _live:
+        st.info("🔒 Upload and save the final allotment in Step 1 first. Publishing is locked "
+                "until then.")
+    else:
+        st.caption("Once published, everyone sees their duties under **My Allotment** and can "
+                   "submit duty swaps for your approval.")
+        g1, g2 = st.columns(2)
+        if g1.button("🟢 Publish allotment to faculty", type="primary", use_container_width=True,
+                     disabled=_open, key="fa_pub"):
+            set_gate(True); st.rerun()
+        if g2.button("🔴 Hide allotment from faculty", use_container_width=True,
+                     disabled=not _open, key="fa_hide"):
+            set_gate(False); st.rerun()
+
+    # ── STEP 3 — Download ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Step 3 — Download for authorities")
+    if not _live:
+        st.caption("Available after the final allotment is saved.")
+    else:
         st.download_button(
             "⬇ Download Final Allotment for Authorities (Excel)",
             data=build_authority_excel(_live, db_get_all_faculty(), offline_df),
             file_name=f"Final_Invigilation_Allotment_{datetime.date.today():%d-%m-%Y}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary", use_container_width=True, key="dl_authority")
+            use_container_width=True, key="dl_authority")
         st.caption("Faculty and research scholars together · sheets: Faculty-wise, Date-wise, "
-                   "Session Summary · includes every approved swap.")
-
-    # ── Upload manually corrected allotment ────────────────────
-    with st.expander("📤 Upload final allotment (after manual changes)", expanded=not _live):
-        st.caption("Upload the corrected allotment Excel — the file downloaded from this app "
-                   "(Final_Allocation / Allocation_Report / authorities file) after your edits. "
-                   "It needs Name (or ID No.), Date and Session columns. "
-                   "This REPLACES the allotment faculty see, and closes any open swap requests.")
-        _f = st.file_uploader("Final allotment (.xlsx)", type=["xlsx", "xls"], key="fa_upload")
-        if _f:
-            try:
-                _recs, _errs = parse_final_allotment(_f, fac_df)
-            except Exception as _e:
-                _recs, _errs = [], [f"Could not read the file: {_e}"]
-            _chk = check_allotment(_recs, fac_df, offline_df) if _recs else {"errors": [], "warnings": []}
-            _errs = _errs + _chk["errors"]
-            st.info(f"**{len(_recs)}** duties read for "
-                    f"**{len({r['faculty_id'] for r in _recs})}** faculty / scholars.")
-            if _errs:
-                st.error(f"❌ {len(_errs)} problem(s) — fix these in the Excel and upload again:")
-                st.markdown("\n".join(f"- {e}" for e in _errs[:40]))
-            if _chk["warnings"]:
-                with st.expander(f"⚠ {len(_chk['warnings'])} item(s) to review "
-                                 "(allowed, since you changed them manually)"):
-                    st.markdown("\n".join(f"- {w}" for w in _chk["warnings"]))
-            elif _recs and not _errs:
-                st.success("✔ Every session matches the duty schedule and every person has "
-                           "their expected number of duties.")
-            if _recs and not _errs:
-                _ok = st.checkbox("I confirm this is the final allotment", key="fa_confirm")
-                if st.button("✅ Replace Final Allotment", type="primary", disabled=not _ok,
-                             use_container_width=True, key="fa_apply"):
-                    try:
-                        db_save_allocation(_recs)
-                        _n = len(db_get_all_allocation())
-                        try:
-                            for _sw in db_swaps_all():
-                                if _sw.get("status") in SWAP_OPEN_STATUSES:
-                                    db_swap_update(_sw["id"], {"status": "superseded",
-                                        "admin_note": "Closed: final allotment re-uploaded"})
-                        except Exception:
-                            pass
-                        if _n == len(_recs):
-                            st.success(f"✅ Final allotment saved ({_n} duties). "
-                                       "Click 'Publish to faculty' when ready.")
-                        else:
-                            st.error(f"❌ Only {_n} of {len(_recs)} duties were saved — check "
-                                     "Row Level Security on final_allocation.")
-                    except Exception as _e:
-                        st.error(f"❌ Save failed: {_e}")
+                   "Session Summary · always includes every approved swap — download again "
+                   "after approving swaps.")
 
 
 def section_swap(fac_df, my_fid: str, preview: bool = False):
@@ -3860,7 +3881,7 @@ def page_allotment(fac_df, sel_name, sel_clean, frow, offline_df, online_df):
             f" → <b>{_ae.strftime('%d-%m-%Y')} ({_ae.strftime('%A')})</b>"
             f"</div>", unsafe_allow_html=True)
 
-    if not gate_is_open():
+    if not gate_is_open() or not db_get_all_allocation():
         st.markdown(
             "<div style='background:#fef3c7;border:2px solid #f59e0b;border-radius:12px;"
             "padding:22px 26px;text-align:center;margin:18px 0'>"
